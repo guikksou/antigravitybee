@@ -32,7 +32,10 @@ The widget launches automatically on your next Antigravity session. You can also
 ## Requirements
 
 - **Windows**: Python 3.10+ (uses standard library `tkinter` and `ctypes`).
-- **Linux**: Python 3.10+ with `python3-tk` (`sudo apt install python3-tk`).
+- **Linux**: Python 3.10+ with `tkinter`:
+  - Debian / Ubuntu: `sudo apt install python3-tk`
+  - Arch Linux: `sudo pacman -S tk`
+  - Fedora: `sudo dnf install python3-tkinter`
 
 ## Architecture
 
