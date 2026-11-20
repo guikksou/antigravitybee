@@ -17,7 +17,7 @@ It runs as an always-on-top desktop widget and reacts in real time (with zero to
 - **Desktop Interactions**
   - 4 integer pixel-art scale presets: Small (`3x`), Medium (`4x`), Large (`5x`), and Extra Large (`7x`).
   - Subtle 1-pixel eye tracking towards the mouse cursor.
-  - Mouse petting detection, click-to-acknowledge alerts, drag-and-drop with inertia, and Ghost Mode (45% opacity while idle/working, 100% when hovered or alerting).
+  - Mouse petting detection, click-to-acknowledge alerts, drag-and-drop with leg tilt physics, and Ghost Mode (45% opacity while idle/working, 100% when hovered or alerting).
 
 ## Installation
 

@@ -12,7 +12,7 @@ By default after installation, the widget launches automatically via lifecycle h
 
 ## Available Commands
 
-Use the CLI controller [bee_ctl.py](./scripts/bee_ctl.py) via `run_command`:
+Use the CLI controller [bee_ctl.py](./scripts/bee_ctl.py) via `run_command` (on Linux systems where only `python3` is installed, use `python3` in place of `python`):
 
 1. **Start or wake the bee** (`/bee` or `/bee start`):
    ```bash

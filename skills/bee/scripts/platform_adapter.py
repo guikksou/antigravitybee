@@ -10,6 +10,7 @@ Cleanly separates Windows (Win32) and Linux (X11/Wayland/POSIX) specifics:
 - PID liveness check & termination
 """
 
+import atexit
 import ctypes
 import os
 import signal
@@ -23,11 +24,115 @@ IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 
 _SINGLETON_HANDLE = None
+_KERNEL32 = None
 _X11_LIB = None
 _XEXT_LIB = None
 _X11_DISPLAY = None
 _X11_INIT_DONE = False
 _X11_TOPLEVEL_CACHE = {}
+
+_WRAPPER_NAMES = {
+    "python",
+    "python.exe",
+    "python3",
+    "pythonw",
+    "pythonw.exe",
+    "cmd",
+    "cmd.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
+    "conhost",
+    "conhost.exe",
+    "sh",
+    "sh.exe",
+    "bash",
+    "bash.exe",
+    "dash",
+    "zsh",
+    "fish",
+    "nu",
+    "uv",
+    "uv.exe",
+    "env",
+}
+_WRAPPER_PREFIXES = (
+    "python",
+    "py",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "fish",
+    "nu",
+    "conhost",
+    "uv",
+    "env",
+)
+
+
+def _is_wrapper_process(name: str) -> bool:
+    """Return True if process name is a shell, interpreter, or launcher wrapper."""
+    return name in _WRAPPER_NAMES or name.startswith(_WRAPPER_PREFIXES)
+
+
+if IS_WINDOWS:
+    from ctypes import wintypes
+
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+
+def _get_kernel32():
+    """Return kernel32 WinDLL with use_last_error=True and 64-bit-safe argtypes/restype."""
+    global _KERNEL32
+    if _KERNEL32 is not None:
+        return _KERNEL32
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.CreateMutexW.restype = wintypes.HANDLE
+
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.GetExitCodeProcess.restype = wintypes.BOOL
+
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.TerminateProcess.restype = wintypes.BOOL
+
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    k32.Process32FirstW.restype = wintypes.BOOL
+
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    k32.Process32NextW.restype = wintypes.BOOL
+
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+
+    _KERNEL32 = k32
+    return _KERNEL32
 
 
 class _XRectangle(ctypes.Structure):
@@ -70,6 +175,8 @@ def _ensure_x11_shape():
         _X11_LIB.XQueryTree.restype = ctypes.c_int
         _X11_LIB.XFree.argtypes = [ctypes.c_void_p]
         _X11_LIB.XFree.restype = ctypes.c_int
+        _X11_LIB.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        _X11_LIB.XCloseDisplay.restype = ctypes.c_int
 
         _XEXT_LIB.XShapeCombineRectangles.argtypes = [
             ctypes.c_void_p,  # Display*
@@ -85,10 +192,23 @@ def _ensure_x11_shape():
         _XEXT_LIB.XShapeCombineRectangles.restype = None
 
         _X11_DISPLAY = _X11_LIB.XOpenDisplay(None)
+        if _X11_DISPLAY:
+            atexit.register(_close_x11_display)
         return bool(_X11_DISPLAY)
     except Exception:
         _X11_DISPLAY = None
         return False
+
+
+def _close_x11_display():
+    """Close the cached X11 Display connection cleanly on process exit."""
+    global _X11_DISPLAY
+    if _X11_LIB is not None and _X11_DISPLAY:
+        try:
+            _X11_LIB.XCloseDisplay(_X11_DISPLAY)
+        except Exception:
+            pass
+        _X11_DISPLAY = None
 
 
 def _get_x11_toplevel_and_inner(root: tk.Tk) -> list[int]:
@@ -136,19 +256,23 @@ def _get_x11_toplevel_and_inner(root: tk.Tk) -> list[int]:
     return targets
 
 
-def apply_window_shape_rects(root: tk.Tk, rects: list[tuple[int, int, int, int]]):
+def apply_window_shape_rects(root: tk.Tk, rects: list[tuple[int, int, int, int]]) -> bool:
     """
     On Linux (X11/XWayland), apply an exact pixel-art non-rectangular bounding mask
     to both the outer TopLevel window and inner Tk wrapper so the background is 100%
     transparent without any black box or unredrawn artifacts.
+    Returns True if the XShape mask was applied, False otherwise.
     No-op on Windows (which uses -transparentcolor natively).
     """
     if not IS_LINUX or not _ensure_x11_shape():
-        return
+        return False
     try:
+        root.update_idletasks()
+        if not root.winfo_ismapped():
+            return False
         targets = _get_x11_toplevel_and_inner(root)
         if not targets:
-            return
+            return False
         n = len(rects)
         if n == 0:
             arr = (_XRectangle * 1)((0, 0, 1, 1))
@@ -159,8 +283,9 @@ def apply_window_shape_rects(root: tk.Tk, rects: list[tuple[int, int, int, int]]
         for xid in targets:
             _XEXT_LIB.XShapeCombineRectangles(_X11_DISPLAY, xid, 0, 0, 0, arr, n, 0, 0)
         _X11_LIB.XFlush(_X11_DISPLAY)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def acquire_single_instance_lock(lock_path: Path) -> bool:
@@ -171,15 +296,20 @@ def acquire_single_instance_lock(lock_path: Path) -> bool:
     global _SINGLETON_HANDLE
     if IS_WINDOWS:
         try:
+            kernel32 = _get_kernel32()
             mutex_name = "Local\\AntigravityBeeCompanionSingletonMutex"
-            handle = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
-            last_err = ctypes.windll.kernel32.GetLastError()
-            if not handle or last_err == 183:  # ERROR_ALREADY_EXISTS
+            ctypes.set_last_error(0)
+            handle = kernel32.CreateMutexW(None, False, mutex_name)
+            last_err = ctypes.get_last_error()
+            if not handle:
+                return False
+            if last_err == 183:  # ERROR_ALREADY_EXISTS
+                kernel32.CloseHandle(handle)
                 return False
             _SINGLETON_HANDLE = handle
             return True
         except Exception:
-            return True
+            return False
     else:
         try:
             import fcntl
@@ -191,16 +321,36 @@ def acquire_single_instance_lock(lock_path: Path) -> bool:
         except Exception:
             return False
 
+
 def init_dpi_awareness():
     """Enable crisp high-DPI rendering before Tk root creation."""
-    if IS_WINDOWS:
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
+    if not IS_WINDOWS:
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+        for level in (2, 1):
+            if shcore.SetProcessDpiAwareness(level) == 0:
+                return
+    except Exception:
+        pass
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetProcessDPIAware.argtypes = []
+        user32.SetProcessDPIAware.restype = wintypes.BOOL
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 def configure_overlay_window(root: tk.Tk, transparent_key: str = TRANSPARENT_KEY):
@@ -210,16 +360,8 @@ def configure_overlay_window(root: tk.Tk, transparent_key: str = TRANSPARENT_KEY
 
     if IS_WINDOWS:
         root.wm_attributes("-transparentcolor", transparent_key)
-    elif IS_LINUX:
-        # On Linux X11/Wayland compositors, set dock/utility hint and wait visibility
-        try:
-            root.wm_attributes("-type", "dock")
-        except Exception:
-            pass
-        try:
-            root.wait_visibility(root)
-        except Exception:
-            pass
+    # On Linux, overrideredirect(True) + -topmost avoids EWMH dock struts and
+    # wait_visibility() hangs on tiling/headless WMs before geometry/pack.
 
 
 def set_window_opacity(root: tk.Tk, alpha: float):
@@ -235,17 +377,24 @@ def is_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-        )
-        if handle:
-            exit_code = ctypes.c_ulong()
-            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return exit_code.value == 259  # STILL_ACTIVE
-        # ERROR_ACCESS_DENIED (5) means the process exists at a higher integrity level
-        return ctypes.windll.kernel32.GetLastError() == 5
+        try:
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = _get_kernel32()
+            ctypes.set_last_error(0)
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if handle:
+                try:
+                    exit_code = wintypes.DWORD()
+                    ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                    return bool(ok) and exit_code.value == 259  # STILL_ACTIVE
+                finally:
+                    kernel32.CloseHandle(handle)
+            # ERROR_ACCESS_DENIED (5) means the process exists at a higher integrity level
+            return ctypes.get_last_error() == 5
+        except Exception:
+            return False
     else:
         try:
             os.kill(pid, 0)
@@ -263,64 +412,33 @@ def get_antigravity_host_pid() -> int:
     Walk up the process tree from the current hook/CLI process past shell and Python
     wrappers to find the actual Antigravity host process PID (Windows & Linux).
     """
-    wrappers = {
-        "python",
-        "python.exe",
-        "python3",
-        "pythonw",
-        "pythonw.exe",
-        "cmd",
-        "cmd.exe",
-        "powershell",
-        "powershell.exe",
-        "pwsh",
-        "pwsh.exe",
-        "conhost",
-        "conhost.exe",
-        "sh",
-        "sh.exe",
-        "bash",
-        "bash.exe",
-        "dash",
-        "zsh",
-    }
     if IS_WINDOWS:
         try:
-            from ctypes import wintypes
-
-            class PROCESSENTRY32W(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", wintypes.DWORD),
-                    ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", wintypes.LONG),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", wintypes.WCHAR * 260),
-                ]
-
-            snap = ctypes.windll.kernel32.CreateToolhelp32Snapshot(2, 0)
-            if snap == -1:
+            kernel32 = _get_kernel32()
+            snap = kernel32.CreateToolhelp32Snapshot(2, 0)
+            if not snap or snap == _INVALID_HANDLE_VALUE:
                 return os.getppid()
-            pe = PROCESSENTRY32W()
-            pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
             procs = {}
-            if ctypes.windll.kernel32.Process32FirstW(snap, ctypes.byref(pe)):
-                while True:
-                    procs[pe.th32ProcessID] = (pe.th32ParentProcessID, pe.szExeFile.lower())
-                    if not ctypes.windll.kernel32.Process32NextW(snap, ctypes.byref(pe)):
-                        break
-            ctypes.windll.kernel32.CloseHandle(snap)
+            try:
+                pe = _PROCESSENTRY32W()
+                pe.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+                if kernel32.Process32FirstW(snap, ctypes.byref(pe)):
+                    while True:
+                        procs[pe.th32ProcessID] = (
+                            pe.th32ParentProcessID,
+                            pe.szExeFile.lower(),
+                        )
+                        if not kernel32.Process32NextW(snap, ctypes.byref(pe)):
+                            break
+            finally:
+                kernel32.CloseHandle(snap)
 
-            cur = os.getpid()
+            cur = os.getppid()
             visited = set()
             while cur in procs and cur not in visited:
                 visited.add(cur)
                 ppid, name = procs[cur]
-                if name not in wrappers:
+                if not _is_wrapper_process(name):
                     return cur
                 if ppid <= 0 or ppid == cur:
                     break
@@ -339,7 +457,7 @@ def get_antigravity_host_pid() -> int:
                 if not comm_path.exists() or not stat_path.exists():
                     break
                 name = comm_path.read_text(encoding="utf-8").strip().lower()
-                if name not in wrappers:
+                if not _is_wrapper_process(name):
                     return cur
                 stat_txt = stat_path.read_text(encoding="utf-8")
                 after_comm = stat_txt.rsplit(")", 1)[-1].split()
@@ -359,10 +477,13 @@ def terminate_pid(pid: int):
     if IS_WINDOWS:
         try:
             PROCESS_TERMINATE = 0x0001
-            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            kernel32 = _get_kernel32()
+            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
             if handle:
-                ctypes.windll.kernel32.TerminateProcess(handle, 0)
-                ctypes.windll.kernel32.CloseHandle(handle)
+                try:
+                    kernel32.TerminateProcess(handle, 0)
+                finally:
+                    kernel32.CloseHandle(handle)
         except Exception:
             pass
     else:
@@ -395,7 +516,7 @@ def spawn_detached_widget(script_path: Path) -> int:
     else:
         # Linux / macOS POSIX detached session
         env = os.environ.copy()
-        if "DISPLAY" not in env and "WAYLAND_DISPLAY" not in env:
+        if not env.get("DISPLAY"):
             env["DISPLAY"] = ":0"
         proc = subprocess.Popen(
             [str(py_exe), str(script_path)],
@@ -410,6 +531,6 @@ def spawn_detached_widget(script_path: Path) -> int:
         return proc.pid
 
 
-def play_platform_chime(kind: str, enabled: bool = True):
+def play_platform_chime(kind: str = "", enabled: bool = True):
     """Silent by design (sound removed per user preference)."""
     return

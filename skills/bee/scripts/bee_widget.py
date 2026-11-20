@@ -5,13 +5,17 @@ Antigravity Bee Companion (Main GUI Widget)
 Modular, cross-platform (Windows & Linux) Pixel-Art Desktop Pet.
 """
 
-import json
 import math
 import os
 import random
 import sys
 import time
 import tkinter as tk
+from pathlib import Path
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
 from platform_adapter import (
     IS_LINUX,
@@ -21,16 +25,17 @@ from platform_adapter import (
     configure_overlay_window,
     init_dpi_awareness,
     is_pid_alive,
-    play_platform_chime,
     set_window_opacity,
 )
 from pixel_sprites import PixelArtRenderer
 from state_sync import (
+    CONFIG_FILE,
     PID_FILE,
     STATE_DIR,
     STATE_FILE,
     TranscriptWatcher,
     load_config,
+    read_state,
     save_config,
     write_state,
 )
@@ -39,6 +44,8 @@ init_dpi_awareness()
 
 DONE_TO_IDLE_SECONDS = 45.0
 IDLE_TO_SLEEP_SECONDS = 90.0
+MAX_PARTICLES = 40
+UI_FONT_FAMILY = "DejaVu Sans Mono" if IS_LINUX else "Consolas"
 
 SIZE_PRESETS = {
     "small": {"scale": 3, "width": 200, "height": 180},
@@ -50,7 +57,7 @@ SIZE_PRESETS = {
 
 class KawaiiBeeWidget:
     def __init__(self):
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._claim_single_instance()
 
         self.root = tk.Tk()
@@ -70,8 +77,10 @@ class KawaiiBeeWidget:
         screen_h = self.root.winfo_screenheight()
         default_x = screen_w - self.width - 30
         default_y = screen_h - self.height - 70
-        self.win_x = max(0, min(screen_w - self.width, self.config.get("x", default_x)))
-        self.win_y = max(0, min(screen_h - self.height, self.config.get("y", default_y)))
+        self.win_x, self.win_y = self._clamp_position(
+            self.config.get("x", default_x),
+            self.config.get("y", default_y),
+        )
 
         self.root.geometry(f"{self.width}x{self.height}+{self.win_x}+{self.win_y}")
         self.root.configure(bg=TRANSPARENT_KEY)
@@ -93,12 +102,26 @@ class KawaiiBeeWidget:
         self.mode = "idle"
         self.detail = "Ready"
         self.host_pid = 0
-        self.last_state_mtime = 0.0
+        self.last_state_mtime_ns = 0
+        try:
+            self.last_config_mtime_ns = CONFIG_FILE.stat().st_mtime_ns if CONFIG_FILE.exists() else 0
+        except Exception:
+            self.last_config_mtime_ns = 0
         self.last_mode_change = time.time()
         self.last_interaction = time.time()
-        self.sound_enabled = self.config.get("sound", True)
         self.ghost_mode = self.config.get("ghost", False)
         self.auto_launch = self.config.get("auto_launch", True)
+
+        # Lifecycle & Caching
+        self._quitting = False
+        self._poll_after_id = None
+        self._anim_after_id = None
+        self._leave_after_id = None
+        self._last_shape_key = None
+        self._cached_look_dx = 0
+        self._cached_look_dy = 0
+        self._bubble_measure_cache = {}
+        self._drag_moved_this_frame = False
 
         # Mouse & physics state
         self.is_dragging = False
@@ -140,16 +163,51 @@ class KawaiiBeeWidget:
         self.canvas.bind("<Motion>", self.on_mouse_move)
 
         self._build_context_menu()
-        cur_st = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
-        if cur_st.get("host_pid", 0) > 0:
-            self.host_pid = int(cur_st["host_pid"])
+        cur_st = read_state()
+        new_host_pid = int(cur_st.get("host_pid", 0) or 0) if cur_st else 0
+        if new_host_pid > 0 and is_pid_alive(new_host_pid):
+            self.host_pid = new_host_pid
+        else:
+            self.host_pid = 0
         init_mode = cur_st.get("mode", "") if cur_st else ""
-        if not cur_st or init_mode in ("quit", "quit_disable", "") or init_mode.startswith("size:"):
-            write_state("idle", "Idle", swarm_active=False)
+        if not cur_st or init_mode in ("quit", "quit_disable", "", "honey") or init_mode.startswith("size:"):
+            write_state("idle", "Idle", swarm_active=False, host_pid=self.host_pid)
         self._apply_opacity()
 
         self.poll_state()
-        self.animate()
+        if not self._quitting:
+            self.animate()
+
+    def _get_virtual_screen_bounds(self) -> tuple[int, int, int, int]:
+        """Return (min_x, min_y, max_x, max_y) across all connected monitors."""
+        if not IS_LINUX and sys.platform == "win32":
+            try:
+                import ctypes
+                u32 = ctypes.windll.user32
+                vx = int(u32.GetSystemMetrics(76))
+                vy = int(u32.GetSystemMetrics(77))
+                vw = int(u32.GetSystemMetrics(78))
+                vh = int(u32.GetSystemMetrics(79))
+                if vw > 0 and vh > 0:
+                    return vx, vy, vx + vw, vy + vh
+            except Exception:
+                pass
+        try:
+            vx = int(self.root.winfo_vrootx())
+            vy = int(self.root.winfo_vrooty())
+            vw = int(self.root.winfo_vrootwidth())
+            vh = int(self.root.winfo_vrootheight())
+            if vw > 0 and vh > 0:
+                return vx, vy, vx + vw, vy + vh
+        except Exception:
+            pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _clamp_position(self, x: int, y: int) -> tuple[int, int]:
+        vx0, vy0, vx1, vy1 = self._get_virtual_screen_bounds()
+        cx = max(vx0, min(vx1 - self.width, int(x)))
+        cy = max(vy0, min(vy1 - self.height, int(y)))
+        return cx, cy
 
     def _claim_single_instance(self):
         # 1. OS Kernel Mutex / flock check: if another bee is already running, exit immediately!
@@ -159,13 +217,20 @@ class KawaiiBeeWidget:
         PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
 
     def _persist_config(self):
-        self.config["x"] = self.win_x
-        self.config["y"] = self.win_y
-        self.config["sound"] = self.sound_enabled
-        self.config["ghost"] = self.ghost_mode
-        self.config["auto_launch"] = self.auto_launch
-        self.config["size"] = self.size_name
-        save_config(self.config)
+        latest = load_config()
+        latest["x"] = self.win_x
+        latest["y"] = self.win_y
+        latest["ghost"] = self.ghost_mode
+        latest["auto_launch"] = self.auto_launch
+        latest["size"] = self.size_name
+        latest.pop("sound", None)
+        self.config = latest
+        save_config(latest)
+        try:
+            if CONFIG_FILE.exists():
+                self.last_config_mtime_ns = CONFIG_FILE.stat().st_mtime_ns
+        except Exception:
+            pass
 
     def set_size(self, size_name: str):
         size_name = size_name.lower()
@@ -178,10 +243,8 @@ class KawaiiBeeWidget:
         self.height = preset["height"]
         self.renderer.set_scale(self.pixel_scale)
         self.canvas.configure(width=self.width, height=self.height)
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        self.win_x = max(0, min(screen_w - self.width, self.win_x))
-        self.win_y = max(0, min(screen_h - self.height, self.win_y))
+        self.win_x, self.win_y = self._clamp_position(self.win_x, self.win_y)
+        self._last_shape_key = None
         self.root.geometry(f"{self.width}x{self.height}+{self.win_x}+{self.win_y}")
         self._persist_config()
 
@@ -193,7 +256,7 @@ class KawaiiBeeWidget:
             fg="#FFF394",
             activebackground="#FFCC33",
             activeforeground="#2C1810",
-            font=("Consolas", 9, "bold"),
+            font=(UI_FONT_FAMILY, 9, "bold"),
         )
         self.menu.add_command(label="Feed Honey", command=self.feed_honey)
         self.menu.add_command(label="Poke / Wave", command=self.trigger_poke)
@@ -205,7 +268,7 @@ class KawaiiBeeWidget:
             fg="#FFF394",
             activebackground="#FFCC33",
             activeforeground="#2C1810",
-            font=("Consolas", 9),
+            font=(UI_FONT_FAMILY, 9),
         )
         modes = [
             ("Idle", "idle", "Idle"),
@@ -234,7 +297,7 @@ class KawaiiBeeWidget:
             fg="#FFF394",
             activebackground="#FFCC33",
             activeforeground="#2C1810",
-            font=("Consolas", 9),
+            font=(UI_FONT_FAMILY, 9),
         )
         size_menu.add_command(label="Small (3x)", command=lambda: self.set_size("small"))
         size_menu.add_command(label="Medium (4x)", command=lambda: self.set_size("medium"))
@@ -268,14 +331,17 @@ class KawaiiBeeWidget:
     def on_left_drag(self, event):
         if not self.is_dragging:
             return
-        new_x = event.x_root - self.drag_start_x
-        new_y = event.y_root - self.drag_start_y
+        new_x, new_y = self._clamp_position(
+            event.x_root - self.drag_start_x,
+            event.y_root - self.drag_start_y,
+        )
         dx = new_x - self.win_x
         dy = new_y - self.win_y
         if abs(dx) > 3 or abs(dy) > 3:
             self.drag_moved = True
         self.vx = dx
         self.vy = dy
+        self._drag_moved_this_frame = True
         self.win_x = new_x
         self.win_y = new_y
         self.root.geometry(f"+{self.win_x}+{self.win_y}")
@@ -299,21 +365,46 @@ class KawaiiBeeWidget:
         self.feed_honey()
 
     def on_right_click(self, event):
-        if IS_LINUX:
+        try:
             self.menu.tk_popup(event.x_root, event.y_root)
-        else:
-            try:
-                self.menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                self.menu.grab_release()
+        finally:
+            self.menu.grab_release()
 
     def on_mouse_enter(self, event):
+        if self._leave_after_id is not None:
+            try:
+                self.root.after_cancel(self._leave_after_id)
+            except Exception:
+                pass
+            self._leave_after_id = None
         self.is_hovered = True
         self._apply_opacity()
 
     def on_mouse_leave(self, event):
+        if self._leave_after_id is not None:
+            try:
+                self.root.after_cancel(self._leave_after_id)
+            except Exception:
+                pass
+        self._leave_after_id = self.root.after(120, self._confirm_mouse_leave)
+
+    def _confirm_mouse_leave(self):
+        self._leave_after_id = None
+        if self._quitting:
+            return
+        try:
+            mx, my = self.root.winfo_pointerxy()
+            cx = self.win_x + self.width // 2
+            base_cy = self.win_y + int(self.height * 0.54)
+            rx = 16 * self.pixel_scale
+            ry = 18 * self.pixel_scale
+            if abs(mx - cx) <= rx and abs(my - base_cy) <= ry:
+                return
+        except Exception:
+            pass
         self.is_hovered = False
         self.last_mouse_x = None
+        self.pet_score = 0.0
         self._apply_opacity()
 
     def on_mouse_move(self, event):
@@ -347,7 +438,6 @@ class KawaiiBeeWidget:
             self.mode = "idle"
         self.poke_until = now + 0.6
         self.spawn_particles("sparkle", 5)
-        play_platform_chime("poke", self.sound_enabled)
 
     def feed_honey(self):
         now = time.time()
@@ -356,20 +446,12 @@ class KawaiiBeeWidget:
             self.mode = "idle"
         self.eating_until = now + 3.2
         self.spawn_particles("heart", 6)
-        play_platform_chime("honey", self.sound_enabled)
 
     def toggle_ghost_mode(self):
         self.ghost_mode = not self.ghost_mode
         self._persist_config()
         self._apply_opacity()
         self.show_bubble("Ghost Mode: " + ("ON" if self.ghost_mode else "OFF"), 2.0)
-
-    def toggle_sound(self):
-        self.sound_enabled = not self.sound_enabled
-        self._persist_config()
-        self.show_bubble("Sound: " + ("ON" if self.sound_enabled else "OFF"), 2.0)
-        if self.sound_enabled:
-            play_platform_chime("poke", True)
 
     def toggle_auto_launch(self):
         self.auto_launch = not self.auto_launch
@@ -380,22 +462,41 @@ class KawaiiBeeWidget:
     def reset_position(self):
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        self.win_x = screen_w - self.width - 30
-        self.win_y = screen_h - self.height - 70
+        self.win_x, self.win_y = self._clamp_position(
+            screen_w - self.width - 30,
+            screen_h - self.height - 70,
+        )
         self.root.geometry(f"+{self.win_x}+{self.win_y}")
         self._persist_config()
 
     def quit_bee(self, disable_auto: bool = False):
+        if self._quitting:
+            return
+        self._quitting = True
         if disable_auto:
             self.auto_launch = False
             self._persist_config()
+        for attr in ("_poll_after_id", "_anim_after_id", "_leave_after_id"):
+            after_id = getattr(self, attr, None)
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         try:
             if PID_FILE.exists():
                 PID_FILE.unlink()
         except Exception:
             pass
-        self.root.destroy()
-        sys.exit(0)
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def _apply_opacity(self):
         if self.is_hovered or self.mode in ("needs_input", "done", "error"):
@@ -413,6 +514,8 @@ class KawaiiBeeWidget:
         cx, cy = self.width // 2, int(self.height * 0.52)
         s = self.pixel_scale / 4.0
         for _ in range(count):
+            if len(self.particles) >= MAX_PARTICLES:
+                self.particles.pop(0)
             if kind == "heart":
                 self.particles.append({
                     "x": cx + random.uniform(-28 * s, 28 * s),
@@ -466,38 +569,67 @@ class KawaiiBeeWidget:
             if new_mode == "needs_input":
                 self.show_bubble(f"! {self.detail or 'Waiting for user input!'}", 12.0)
                 self.spawn_particles("sparkle", 6)
-                play_platform_chime("needs_input", self.sound_enabled)
             elif new_mode == "done":
                 self.show_bubble(f"OK: {self.detail or 'Task completed!'}", 6.0)
-                play_platform_chime("done", self.sound_enabled)
             elif new_mode == "error":
                 self.show_bubble(f"ERR: {self.detail or 'Error encountered'}", 8.0)
-                play_platform_chime("error", self.sound_enabled)
             elif self.detail:
                 self.show_bubble(self.detail, 3.5)
 
     def poll_state(self):
+        if self._quitting:
+            return
         now = time.time()
         try:
+            if CONFIG_FILE.exists():
+                cfg_mtime_ns = CONFIG_FILE.stat().st_mtime_ns
+                if cfg_mtime_ns != self.last_config_mtime_ns:
+                    self.last_config_mtime_ns = cfg_mtime_ns
+                    new_cfg = load_config()
+                    self.config = new_cfg
+                    self.auto_launch = bool(new_cfg.get("auto_launch", True))
+                    new_ghost = bool(new_cfg.get("ghost", False))
+                    if new_ghost != self.ghost_mode:
+                        self.ghost_mode = new_ghost
+                        self._apply_opacity()
+                    new_size = str(new_cfg.get("size", "medium")).lower()
+                    if new_size in SIZE_PRESETS and new_size != self.size_name:
+                        self.set_size(new_size)
+        except Exception:
+            pass
+
+        try:
             if STATE_FILE.exists():
-                mtime = STATE_FILE.stat().st_mtime
-                if mtime > self.last_state_mtime:
-                    data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-                    self.last_state_mtime = mtime
-                    if data.get("host_pid", 0) > 0:
-                        self.host_pid = int(data["host_pid"])
-                    new_mode = data.get("mode", "idle")
-                    new_detail = data.get("detail", "")
-                    if new_mode == "quit":
-                        self.quit_bee(disable_auto=False)
-                        return
-                    if new_mode == "quit_disable":
-                        self.quit_bee(disable_auto=True)
-                        return
-                    if new_mode.startswith("size:"):
-                        self.set_size(new_mode.split(":", 1)[1])
-                    else:
-                        self.set_mode(new_mode, new_detail)
+                mtime_ns = STATE_FILE.stat().st_mtime_ns
+                if mtime_ns != self.last_state_mtime_ns:
+                    data = read_state()
+                    if data:
+                        self.last_state_mtime_ns = mtime_ns
+                        new_host_pid = int(data.get("host_pid", 0) or 0)
+                        if new_host_pid > 0 and is_pid_alive(new_host_pid):
+                            self.host_pid = new_host_pid
+                        else:
+                            self.host_pid = 0
+                        new_mode = data.get("mode", "idle")
+                        new_detail = data.get("detail", "")
+                        if new_mode == "quit":
+                            self.quit_bee(disable_auto=False)
+                            return
+                        if new_mode == "quit_disable":
+                            self.quit_bee(disable_auto=True)
+                            return
+                        if new_mode.startswith("size:"):
+                            self.set_size(new_mode.split(":", 1)[1])
+                            write_state(self.mode, self.detail or "Idle")
+                            if STATE_FILE.exists():
+                                self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
+                        elif new_mode == "honey":
+                            self.set_mode(new_mode, new_detail)
+                            write_state(self.mode, self.detail or "Idle")
+                            if STATE_FILE.exists():
+                                self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
+                        else:
+                            self.set_mode(new_mode, new_detail)
         except Exception:
             pass
 
@@ -526,11 +658,14 @@ class KawaiiBeeWidget:
             self.detail = "Zzz... Sleeping"
             self.last_mode_change = now
 
-        self.root.after(250, self.poll_state)
+        if not self._quitting:
+            self._poll_after_id = self.root.after(250, self.poll_state)
 
     # -------------------- 60 FPS Pixel-Art Animation Loop --------------------
 
     def animate(self):
+        if self._quitting:
+            return
         now = time.time()
         t = now - self.t0
         self.frame_count += 1
@@ -601,23 +736,29 @@ class KawaiiBeeWidget:
             # Calm normal eyes in idle AND done (with normal blinking)
             eye_state = "normal"
 
-        # Subtle 1-pixel eye tracking towards mouse cursor
-        look_dx, look_dy = 0, 0
+        # Subtle 1-pixel eye tracking towards mouse cursor (throttled to every 3rd frame)
         if eff_mode == "reading":
             look_dx = -1 if int(t * 3) % 2 == 0 else 1
+            look_dy = 0
         else:
-            try:
-                mx, my = self.root.winfo_pointerxy()
-                rel_x = mx - (self.win_x + bx)
-                rel_y = my - (self.win_y + by)
-                if rel_x < -45:
-                    look_dx = -1
-                elif rel_x > 45:
-                    look_dx = 1
-                if rel_y > 45:
-                    look_dy = 1
-            except Exception:
-                pass
+            if self.frame_count % 3 == 0:
+                try:
+                    mx, my = self.root.winfo_pointerxy()
+                    rel_x = mx - (self.win_x + bx)
+                    rel_y = my - (self.win_y + by)
+                    ldx = -1 if rel_x < -45 else (1 if rel_x > 45 else 0)
+                    ldy = 1 if rel_y > 45 else 0
+                    self._cached_look_dx = ldx
+                    self._cached_look_dy = ldy
+                except Exception:
+                    pass
+            look_dx = self._cached_look_dx
+            look_dy = self._cached_look_dy
+
+        if not self._drag_moved_this_frame:
+            self.vx = 0.0
+            self.vy = 0.0
+        self._drag_moved_this_frame = False
 
         prop_frame = int(t * 4) % 12
         leg_shift = 1 if self.vx < -3 else (-1 if self.vx > 3 else 0)
@@ -630,9 +771,19 @@ class KawaiiBeeWidget:
             fill="#2C1810", outline=""
         )
 
+        # Precompute orbiting mini-bee positions once per frame in swarm mode
+        mini_bee_positions = []
+        if eff_mode == "swarm":
+            for i in range(3):
+                angle = t * 2.6 + i * (2 * math.pi / 3)
+                z = math.sin(angle)
+                mx = int((bx + math.cos(angle) * (15.5 * sc)) // sc) * sc
+                my = int((by + z * (5.0 * sc)) // sc) * sc
+                mini_bee_positions.append((mx, my, z))
+
         # 2. Orbiting mini bees behind (Swarm mode)
         if eff_mode == "swarm":
-            self._draw_mini_bees(bx, by, t, behind=True)
+            self._draw_mini_bees(mini_bee_positions, behind=True)
 
         # 3. Main Pixel-Art Bee Sprite
         sprite = self.renderer.get_bee_sprite(
@@ -642,7 +793,7 @@ class KawaiiBeeWidget:
 
         # 4. Orbiting mini bees in front (Swarm mode)
         if eff_mode == "swarm":
-            self._draw_mini_bees(bx, by, t, behind=False)
+            self._draw_mini_bees(mini_bee_positions, behind=False)
 
         # 5. Pixel-Art Particles
         self._update_and_draw_particles()
@@ -657,57 +808,65 @@ class KawaiiBeeWidget:
 
         # 7. Linux X11 XShape pixel-perfect transparency mask (no-op on Windows)
         if IS_LINUX:
-            shape_rects = [
-                (cx - shadow_w, shadow_y, 2 * shadow_w, sc)
-            ]
-            # Main bee sprite top-left offset (44x40 base grid anchored at center)
-            bee_x0 = bx - 22 * sc
-            bee_y0 = by - 20 * sc
-            for rx, ry, rw, rh in self.renderer.get_bee_rects(
+            norm_key = self.renderer._normalize_key(
                 eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
-            ):
-                shape_rects.append((bee_x0 + rx, bee_y0 + ry, rw, rh))
+            )
+            mb_frame = (self.frame_count // 3) % 2 if eff_mode == "swarm" else -1
+            shape_key = (
+                bx,
+                by,
+                norm_key,
+                shadow_w,
+                tuple((int(p["x"] // 2), int(p["y"] // 2), p["kind"]) for p in self.particles),
+                tuple(bub_rects) if bub_rects else None,
+                mb_frame,
+                tuple((mx, my) for mx, my, _ in mini_bee_positions) if eff_mode == "swarm" else None,
+            )
+            if shape_key != self._last_shape_key:
+                shape_rects = [
+                    (cx - shadow_w, shadow_y, 2 * shadow_w, sc)
+                ]
+                # Main bee sprite top-left offset (44x40 base grid anchored at center)
+                bee_x0 = bx - 22 * sc
+                bee_y0 = by - 20 * sc
+                for rx, ry, rw, rh in self.renderer.get_bee_rects(
+                    eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+                ):
+                    shape_rects.append((bee_x0 + rx, bee_y0 + ry, rw, rh))
 
-            # Mini bees in swarm mode
-            if eff_mode == "swarm":
-                mb_key = f"mini_bee_{(self.frame_count // 3) % 2}"
-                mb_rects, mb_w, mb_h = self.renderer.particle_rects_cache.get(mb_key, ([], 0, 0))
-                for i in range(3):
-                    angle = t * 2.6 + i * (2 * math.pi / 3)
-                    z = math.sin(angle)
-                    mx = int((bx + math.cos(angle) * (15.5 * sc)) // sc) * sc
-                    my = int((by + z * (5.0 * sc)) // sc) * sc
-                    mx0 = mx - mb_w // 2
-                    my0 = my - mb_h // 2
-                    for rx, ry, rw, rh in mb_rects:
-                        shape_rects.append((mx0 + rx, my0 + ry, rw, rh))
+                # Mini bees in swarm mode
+                if eff_mode == "swarm":
+                    mb_key = f"mini_bee_{mb_frame}"
+                    mb_rects, mb_w, mb_h = self.renderer.particle_rects_cache.get(mb_key, ([], 0, 0))
+                    for mx, my, _ in mini_bee_positions:
+                        mx0 = mx - mb_w // 2
+                        my0 = my - mb_h // 2
+                        for rx, ry, rw, rh in mb_rects:
+                            shape_rects.append((mx0 + rx, my0 + ry, rw, rh))
 
-            # Active particles
-            for p in self.particles:
-                p_rects, pw, ph = self.renderer.particle_rects_cache.get(p["kind"], ([], 0, 0))
-                px = int(p["x"] // 2) * 2 - pw // 2
-                py = int(p["y"] // 2) * 2 - ph // 2
-                for rx, ry, rw, rh in p_rects:
-                    shape_rects.append((px + rx, py + ry, rw, rh))
+                # Active particles
+                for p in self.particles:
+                    p_rects, pw, ph = self.renderer.particle_rects_cache.get(p["kind"], ([], 0, 0))
+                    px = int(p["x"] // 2) * 2 - pw // 2
+                    py = int(p["y"] // 2) * 2 - ph // 2
+                    for rx, ry, rw, rh in p_rects:
+                        shape_rects.append((px + rx, py + ry, rw, rh))
 
-            # Speech bubble
-            if bub_rects:
-                shape_rects.extend(bub_rects)
+                # Speech bubble
+                if bub_rects:
+                    shape_rects.extend(bub_rects)
 
-            apply_window_shape_rects(self.root, shape_rects)
+                if apply_window_shape_rects(self.root, shape_rects):
+                    self._last_shape_key = shape_key
 
-        self.root.after(16, self.animate)
+        if not self._quitting:
+            self._anim_after_id = self.root.after(16, self.animate)
 
-    def _draw_mini_bees(self, bx, by, t, behind=True):
-        sc = self.pixel_scale
+    def _draw_mini_bees(self, mini_bee_positions, behind=True):
         mb_sprite = self.renderer.particle_cache[f"mini_bee_{(self.frame_count // 3) % 2}"]
-        for i in range(3):
-            angle = t * 2.6 + i * (2 * math.pi / 3)
-            z = math.sin(angle)
+        for mx, my, z in mini_bee_positions:
             if (behind and z >= 0) or (not behind and z < 0):
                 continue
-            mx = int((bx + math.cos(angle) * (15.5 * sc)) // sc) * sc
-            my = int((by + z * (5.0 * sc)) // sc) * sc
             self.canvas.create_image(mx, my, image=mb_sprite, anchor="center")
 
     def _update_and_draw_particles(self):
@@ -750,35 +909,50 @@ class KawaiiBeeWidget:
         # Create the text item first to measure its true rendered pixel bounding box
         # across different DPI settings (e.g. 96 DPI on Windows vs 192 DPI on Linux).
         font_px = -max(12, int(self.pixel_scale * 3.2))
-        text_id = self.canvas.create_text(
-            x, y,
-            text=text,
-            fill=text_col,
-            font=("Consolas", font_px, "bold"),
-        )
-        bbox = self.canvas.bbox(text_id)
-        if bbox:
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
+        cache_key = (text, self.width, font_px)
+        cached = self._bubble_measure_cache.get(cache_key)
+        if cached is not None:
+            disp_text, w, h = cached
+            text_id = self.canvas.create_text(
+                x, y,
+                text=disp_text,
+                fill=text_col,
+                font=(UI_FONT_FAMILY, font_px, "bold"),
+            )
         else:
-            tw = len(text) * abs(font_px)
-            th = abs(font_px) + 4
-
-        max_w = self.width - 8
-        # If the rendered text is still wider than the widget canvas, trim characters
-        while tw + 24 > max_w and len(text) > 6:
-            text = text[:-3] + ".."
-            self.canvas.itemconfigure(text_id, text=text)
+            text_id = self.canvas.create_text(
+                x, y,
+                text=text,
+                fill=text_col,
+                font=(UI_FONT_FAMILY, font_px, "bold"),
+            )
             bbox = self.canvas.bbox(text_id)
             if bbox:
                 tw = bbox[2] - bbox[0]
                 th = bbox[3] - bbox[1]
             else:
-                break
+                tw = len(text) * abs(font_px)
+                th = abs(font_px) + 4
 
-        w = max(84, min(max_w, tw + 24))
-        w = ((w + 3) // 4) * 4
-        h = max(28, ((th + 16 + 3) // 4) * 4)
+            max_w = self.width - 8
+            disp_text = text
+            # If the rendered text is still wider than the widget canvas, trim characters
+            while tw + 24 > max_w and len(disp_text) > 6:
+                disp_text = disp_text[:-3] + ".."
+                self.canvas.itemconfigure(text_id, text=disp_text)
+                bbox = self.canvas.bbox(text_id)
+                if bbox:
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                else:
+                    break
+
+            w = max(84, min(max_w, tw + 24))
+            w = ((w + 3) // 4) * 4
+            h = max(28, ((th + 16 + 3) // 4) * 4)
+            if len(self._bubble_measure_cache) > 128:
+                self._bubble_measure_cache.clear()
+            self._bubble_measure_cache[cache_key] = (disp_text, w, h)
 
         # Keep the entire speech box within the top edge of the canvas
         y = max(h // 2 + 2, y)
@@ -816,7 +990,8 @@ class KawaiiBeeWidget:
         ]
 
     def run(self):
-        self.root.mainloop()
+        if not self._quitting:
+            self.root.mainloop()
 
 
 if __name__ == "__main__":

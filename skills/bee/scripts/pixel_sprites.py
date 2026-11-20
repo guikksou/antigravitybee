@@ -5,6 +5,7 @@ Pixel-Art Sprite Engine for Antigravity Bee Companion.
 Contains the color palette, 2D ASCII pixel matrices, and cached tk.PhotoImage generator.
 """
 
+from collections import OrderedDict
 import tkinter as tk
 from platform_adapter import TRANSPARENT_KEY
 
@@ -40,8 +41,8 @@ class PixelArtRenderer:
 
     def __init__(self, scale: int = PIXEL_SCALE):
         self.scale = scale
-        self.cache = {}
-        self.rects_cache = {}
+        self.cache = OrderedDict()
+        self.rects_cache = OrderedDict()
         self.particle_cache = {}
         self.particle_rects_cache = {}
         self._init_particle_sprites()
@@ -177,6 +178,40 @@ class PixelArtRenderer:
             len(mini_bee_1) * p_scale,
         )
 
+    @staticmethod
+    def _normalize_key(
+        eff_mode: str,
+        wing_frame: int,
+        eye_state: str,
+        look_dx: int,
+        look_dy: int,
+        prop_frame: int,
+        leg_shift: int,
+    ) -> tuple:
+        if eff_mode in ("idle", "sleep", "done", "swarm", "dragged", "petting", "error"):
+            eff_prop = 0
+        elif eff_mode == "coding":
+            eff_prop = prop_frame % 4
+        elif eff_mode == "web":
+            eff_prop = prop_frame % 12
+        elif eff_mode in ("thinking", "reading"):
+            eff_prop = prop_frame % 3
+        else:
+            eff_prop = prop_frame % 2
+
+        if eye_state in ("sleep", "happy", "dizzy"):
+            eff_dx, eff_dy = 0, 0
+        else:
+            eff_dx = max(-1, min(1, look_dx))
+            eff_dy = max(0, min(1, look_dy))
+
+        if eff_mode == "sleep":
+            eff_wing, eff_leg = 0, 0
+        else:
+            eff_wing, eff_leg = wing_frame, leg_shift
+
+        return (eff_mode, eff_wing, eye_state, eff_dx, eff_dy, eff_prop, eff_leg)
+
     def get_bee_sprite(
         self,
         eff_mode: str,
@@ -187,8 +222,13 @@ class PixelArtRenderer:
         prop_frame: int,
         leg_shift: int,
     ) -> tk.PhotoImage:
-        key = (eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift)
+        key = self._normalize_key(
+            eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+        )
         if key in self.cache:
+            self.cache.move_to_end(key)
+            if key in self.rects_cache:
+                self.rects_cache.move_to_end(key)
             return self.cache[key]
 
         W, H = 44, 40
@@ -246,7 +286,7 @@ class PixelArtRenderer:
                 ]
                 draw_sprite(bx + 5, by - 3, bw)
 
-        # 3. Chubby Cute Bee Body (22x14 rounded boxy silhouette)
+        # 3. Chubby Cute Bee Body (22x13 rounded boxy silhouette)
         body = [
             "...OOOOOOOOOOOOOOOO...",
             "..OHHHHHHHSSHHSSHHHO..",
@@ -257,9 +297,9 @@ class PixelArtRenderer:
             "OYYYYYYYYYMMYYMMYYYYYO",
             "OYYYYYYYYYMMYYMMYYYYYO",
             "OYYYYYYYYYMMYYMMYYYYYO",
-            "OAAAAAAAAAMMAAAMAAAAAO",
+            "OAAAAAAAAAMMAAAMMAAAAO",
             ".OAAAAAAAAOOAAOOAAAAO.",
-            "..ODDDDDDDOODDOODDDDO.",
+            "..ODDDDDDDOODDOODDDO..",
             "...OOOOOOOOOOOOOOOO...",
         ]
         draw_sprite(bx, by, body)
@@ -461,10 +501,10 @@ class PixelArtRenderer:
 
         elif eff_mode == "web":
             goggles = [
-                ".OOOO.OOOO.",
+                ".OOOO..OOOO.",
                 "OTWWTOOTWWTO",
                 "OTTTTOOTTTTO",
-                ".OOOO.OOOO.",
+                ".OOOO..OOOO.",
             ]
             draw_sprite(bx + 1, by + 1, goggles)
             wx = (prop_frame * 3) % 10
@@ -506,7 +546,7 @@ class PixelArtRenderer:
                 ".OGEEEEEGO.",
                 "OGGGGGGGGGO",
                 "OGGGGGGGWGO",
-                "OGGGGGGWGO.",
+                "OGGGGGGWGGO",
                 "OGWGGGWGGGO",
                 "OGGWGWGGGGO",
                 "OGGGWGGGGGO",
@@ -549,9 +589,12 @@ class PixelArtRenderer:
 
         photo = self.grid_to_photo(g)
         rects = self.grid_to_rects(g)
-        if len(self.cache) > 256:
-            self.cache.clear()
-            self.rects_cache.clear()
+        while len(self.cache) >= 256:
+            for _ in range(64):
+                if self.cache:
+                    self.cache.popitem(last=False)
+                if self.rects_cache:
+                    self.rects_cache.popitem(last=False)
         self.cache[key] = photo
         self.rects_cache[key] = rects
         return photo
@@ -566,5 +609,12 @@ class PixelArtRenderer:
         prop_frame: int,
         leg_shift: int,
     ) -> list[tuple[int, int, int, int]]:
-        key = (eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift)
+        key = self._normalize_key(
+            eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+        )
+        if key not in self.rects_cache:
+            self.get_bee_sprite(
+                eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+            )
+        self.rects_cache.move_to_end(key)
         return self.rects_cache.get(key, [])
