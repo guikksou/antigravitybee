@@ -302,6 +302,19 @@ class KawaiiBeeWaylandWidget:
             self._using_layer_shell = True
 
         self.win.set_size_request(self.width, self.height)
+        try:
+            geom = Gdk.Geometry()
+            geom.min_width = self.width
+            geom.max_width = self.width
+            geom.min_height = self.height
+            geom.max_height = self.height
+            self.win.set_geometry_hints(
+                None,
+                geom,
+                Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE,
+            )
+        except Exception:
+            pass
         self.win.resize(self.width, self.height)
 
         self.drawing_area = Gtk.DrawingArea()
@@ -468,7 +481,29 @@ class KawaiiBeeWaylandWidget:
             self.drawing_area.set_size_request(self.width, self.height)
         if self.win is not None:
             self.win.set_size_request(self.width, self.height)
+            try:
+                geom = Gdk.Geometry()
+                geom.min_width = self.width
+                geom.max_width = self.width
+                geom.min_height = self.height
+                geom.max_height = self.height
+                self.win.set_geometry_hints(
+                    None,
+                    geom,
+                    Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE,
+                )
+            except Exception:
+                pass
             self.win.resize(self.width, self.height)
+            gdk_win = self.win.get_window()
+            if gdk_win is not None:
+                try:
+                    gdk_win.move_resize(self.win_x, self.win_y, self.width, self.height)
+                except Exception:
+                    try:
+                        gdk_win.resize(self.width, self.height)
+                    except Exception:
+                        pass
             self._move_window(self.win_x, self.win_y)
         self._frame_snapshot = self._compute_frame_state(time.time(), advance=False)
         if self.drawing_area is not None:
@@ -1172,7 +1207,7 @@ class KawaiiBeeWaylandWidget:
             inner_border = "#F59E0B"
             text_col = "#92400E"
 
-        font_px = max(12, int(self.pixel_scale * 3.2))
+        font_px = max(12, int(self.pixel_scale * 3.0))
         cr.select_font_face(UI_FONT_FAMILY, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         cr.set_font_size(font_px)
 
@@ -1184,18 +1219,25 @@ class KawaiiBeeWaylandWidget:
         else:
             disp_text = text
             ext = cr.text_extents(disp_text)
-            tw = ext.width
+            tw = max(ext.width, ext.x_advance)
             th = ext.height
+            # Inner white box has 6px border on left and 6px border on right (12px total)
+            # plus 10px comfortable horizontal padding on each side = 32px total padding
+            pad_w = 32
+            pad_h = 20
             max_w = self.width - 8
-            while tw + 24 > max_w and len(disp_text) > 6:
-                disp_text = disp_text[:-3] + ".."
+            while (tw + pad_w > max_w or len(disp_text) > 26) and len(disp_text) > 5:
+                if disp_text.endswith(".."):
+                    disp_text = disp_text[:-3] + ".."
+                else:
+                    disp_text = disp_text[:-2] + ".."
                 ext = cr.text_extents(disp_text)
-                tw = ext.width
+                tw = max(ext.width, ext.x_advance)
                 th = ext.height
 
-            w = max(84, min(max_w, int(math.ceil(tw)) + 24))
+            w = max(84, min(max_w, int(math.ceil(tw)) + pad_w))
             w = ((w + 3) // 4) * 4
-            h = max(28, ((int(math.ceil(th)) + 16 + 3) // 4) * 4)
+            h = max(28, ((int(math.ceil(th)) + pad_h + 3) // 4) * 4)
             if len(self._bubble_measure_cache) > 128:
                 self._bubble_measure_cache.clear()
             self._bubble_measure_cache[cache_key] = (disp_text, w, h)

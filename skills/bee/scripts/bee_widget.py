@@ -916,7 +916,7 @@ class KawaiiBeeWidget:
 
         # Create the text item first to measure its true rendered pixel bounding box
         # across different DPI settings (e.g. 96 DPI on Windows vs 192 DPI on Linux).
-        font_px = -max(12, int(self.pixel_scale * 3.2))
+        font_px = -max(12, int(self.pixel_scale * 3.0))
         cache_key = (text, self.width, font_px)
         cached = self._bubble_measure_cache.get(cache_key)
         if cached is not None:
@@ -942,11 +942,16 @@ class KawaiiBeeWidget:
                 tw = len(text) * abs(font_px)
                 th = abs(font_px) + 4
 
+            pad_w = 32
+            pad_h = 20
             max_w = self.width - 8
             disp_text = text
             # If the rendered text is still wider than the widget canvas, trim characters
-            while tw + 24 > max_w and len(disp_text) > 6:
-                disp_text = disp_text[:-3] + ".."
+            while tw + pad_w > max_w and len(disp_text) > 5:
+                if disp_text.endswith(".."):
+                    disp_text = disp_text[:-3] + ".."
+                else:
+                    disp_text = disp_text[:-2] + ".."
                 self.canvas.itemconfigure(text_id, text=disp_text)
                 bbox = self.canvas.bbox(text_id)
                 if bbox:
@@ -955,9 +960,9 @@ class KawaiiBeeWidget:
                 else:
                     break
 
-            w = max(84, min(max_w, tw + 24))
+            w = max(84, min(max_w, tw + pad_w))
             w = ((w + 3) // 4) * 4
-            h = max(28, ((th + 16 + 3) // 4) * 4)
+            h = max(28, ((th + pad_h + 3) // 4) * 4)
             if len(self._bubble_measure_cache) > 128:
                 self._bubble_measure_cache.clear()
             self._bubble_measure_cache[cache_key] = (disp_text, w, h)
