@@ -47,10 +47,14 @@ The widget launches automatically on your next Antigravity session. You can also
 ## Requirements
 
 - **Windows**: Python 3.10+ (uses standard library `tkinter` and `ctypes`).
-- **Linux**: Python 3.10+ with `tkinter`:
+- **Linux (X11)**: Python 3.10+ with `tkinter`:
   - Debian / Ubuntu: `sudo apt install python3-tk`
   - Arch Linux: `sudo pacman -S tk`
   - Fedora: `sudo dnf install python3-tkinter`
+- **Linux (Wayland / Hyprland / Sway)**: Automatically uses the 32-bit ARGB GTK3/Cairo backend (`wayland_widget.py`) for true per-pixel alpha transparency without XWayland black boxes (falls back to `tkinter` if GTK3/PyGObject is not installed):
+  - Arch Linux: `sudo pacman -S python-gobject python-cairo gtk3`
+  - Debian / Ubuntu: `sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0`
+  - Fedora: `sudo dnf install python3-gobject cairo-gobject-devel gtk3`
 
 ## Architecture
 
@@ -62,10 +66,11 @@ The widget launches automatically on your next Antigravity session. You can also
     └── bee/
         ├── SKILL.md            # /bee slash command specification
         └── scripts/
-            ├── platform_adapter.py  # OS abstraction layer (Win32 / Linux X11 & POSIX)
-            ├── pixel_sprites.py     # Palette, 2D pixel grids, and PhotoImage cache
+            ├── platform_adapter.py  # OS abstraction & Wayland/X11/Win32 session detection
+            ├── pixel_sprites.py     # Palette, 2D pixel grids, PhotoImage & color-span caches
             ├── state_sync.py        # Config, atomic state I/O, and transcript watcher
-            ├── bee_widget.py        # Tkinter 60-FPS GUI and mouse event loop
+            ├── bee_widget.py        # Tkinter 60-FPS GUI & Wayland backend dispatcher
+            ├── wayland_widget.py    # 32-bit ARGB GTK3/Cairo 60-FPS GUI for Linux Wayland
             ├── bee_hook.py          # Hook handler and SessionStart auto-launcher
             └── bee_ctl.py           # CLI controller (start, stop, auto, size, honey, mode)
 ```

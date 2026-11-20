@@ -10,7 +10,10 @@ import os
 import random
 import sys
 import time
-import tkinter as tk
+try:
+    import tkinter as tk
+except ImportError:
+    tk = None
 from pathlib import Path
 
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -25,6 +28,7 @@ from platform_adapter import (
     configure_overlay_window,
     init_dpi_awareness,
     is_pid_alive,
+    is_wayland_session,
     set_window_opacity,
 )
 from pixel_sprites import PixelArtRenderer
@@ -57,6 +61,10 @@ SIZE_PRESETS = {
 
 class KawaiiBeeWidget:
     def __init__(self):
+        if tk is None:
+            raise RuntimeError(
+                "tkinter is not installed (and Wayland GTK3 backend was not used)."
+            )
         STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._claim_single_instance()
 
@@ -995,5 +1003,14 @@ class KawaiiBeeWidget:
 
 
 if __name__ == "__main__":
+    if is_wayland_session():
+        try:
+            from wayland_widget import can_use_wayland_gtk, run_wayland_widget
+
+            if can_use_wayland_gtk():
+                run_wayland_widget()
+                sys.exit(0)
+        except Exception:
+            pass
     app = KawaiiBeeWidget()
     app.run()

@@ -10,18 +10,44 @@ Cleanly separates Windows (Win32) and Linux (X11/Wayland/POSIX) specifics:
 - PID liveness check & termination
 """
 
+from __future__ import annotations
+
 import atexit
 import ctypes
 import os
 import signal
 import subprocess
 import sys
-import tkinter as tk
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import tkinter as tk
 
 TRANSPARENT_KEY = "#010203"
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
+
+
+def is_wayland_session() -> bool:
+    """
+    Return True when running inside a Linux Wayland session (e.g. Hyprland, Sway,
+    GNOME/KDE Wayland), unless explicitly forced to Tkinter via AGY_BEE_BACKEND=tk.
+    Always returns False on Windows and Linux X11.
+    """
+    if not IS_LINUX:
+        return False
+    backend = os.environ.get("AGY_BEE_BACKEND", "").strip().lower()
+    if backend == "tk":
+        return False
+    if backend == "wayland":
+        return True
+    return bool(
+        os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland"
+        or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        or os.environ.get("SWAYSOCK")
+    )
 
 _SINGLETON_HANDLE = None
 _KERNEL32 = None
@@ -516,8 +542,24 @@ def spawn_detached_widget(script_path: Path) -> int:
     else:
         # Linux / macOS POSIX detached session
         env = os.environ.copy()
-        if not env.get("DISPLAY"):
-            env["DISPLAY"] = ":0"
+        for var in (
+            "WAYLAND_DISPLAY",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "SWAYSOCK",
+            "XDG_RUNTIME_DIR",
+            "XDG_SESSION_TYPE",
+            "DISPLAY",
+        ):
+            val = os.environ.get(var)
+            if val is not None and var not in env:
+                env[var] = val
+        if "DISPLAY" not in env or not env.get("DISPLAY"):
+            if Path("/tmp/.X11-unix/X0").exists():
+                env["DISPLAY"] = ":0"
+            elif Path("/tmp/.X11-unix/X1").exists():
+                env["DISPLAY"] = ":1"
+            elif not is_wayland_session():
+                env["DISPLAY"] = ":0"
         proc = subprocess.Popen(
             [str(py_exe), str(script_path)],
             cwd=str(script_path.parent),

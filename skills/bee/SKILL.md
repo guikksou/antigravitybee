@@ -10,6 +10,8 @@ description: >-
 This skill controls the **Antigravity Bee** pixel-art desktop overlay (Windows & Linux).
 By default after installation, the widget launches automatically via lifecycle hooks (`hooks.json`) with zero token overhead. If auto-launch is disabled, the user can summon or control the widget on demand using `/bee`.
 
+> **Backend selection**: Windows and Linux X11 use the standard `tkinter` GUI (`bee_widget.py`). Linux Wayland sessions (Hyprland, Sway, GNOME/KDE Wayland) automatically dispatch to the 32-bit ARGB GTK3/Cairo backend (`wayland_widget.py`) for true per-pixel alpha transparency, falling back to `tkinter` if PyGObject/GTK3 is unavailable (override with `AGY_BEE_BACKEND=tk` or `wayland`).
+
 ## Available Commands
 
 Use the CLI controller [bee_ctl.py](./scripts/bee_ctl.py) via `run_command` (on Linux systems where only `python3` is installed, use `python3` in place of `python`):

@@ -2,12 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 Pixel-Art Sprite Engine for Antigravity Bee Companion.
-Contains the color palette, 2D ASCII pixel matrices, and cached tk.PhotoImage generator.
+Contains the color palette, 2D ASCII pixel matrices, cached tk.PhotoImage generator,
+and backend-agnostic horizontal color-span generators for Tkinter & Wayland Cairo.
 """
 
+from __future__ import annotations
+
 from collections import OrderedDict
-import tkinter as tk
-from platform_adapter import TRANSPARENT_KEY
+
+try:
+    import tkinter as tk
+except ImportError:
+    tk = None  # Allows pure-Python / Wayland Cairo usage without python3-tk
+
+try:
+    from platform_adapter import TRANSPARENT_KEY
+except ImportError:
+    TRANSPARENT_KEY = "#010203"
 
 PIXEL_SCALE = 4  # 44x40 base pixel grid -> 176x160 crisp screen pixels
 
@@ -36,15 +47,131 @@ PALETTE = {
 }
 
 
-class PixelArtRenderer:
-    """Builds and caches crisp nearest-neighbor zoomed tk.PhotoImage sprites."""
+def hex_to_rgba(hex_str: str) -> tuple[float, float, float, float]:
+    """Convert a '#RRGGBB' (or '#RRGGBBAA' / '.') color string to (r, g, b, a) floats in 0.0..1.0."""
+    if not hex_str or hex_str == ".":
+        return (0.0, 0.0, 0.0, 0.0)
+    s = hex_str.lstrip("#")
+    if len(s) == 6:
+        return (
+            int(s[0:2], 16) / 255.0,
+            int(s[2:4], 16) / 255.0,
+            int(s[4:6], 16) / 255.0,
+            1.0,
+        )
+    if len(s) == 8:
+        return (
+            int(s[0:2], 16) / 255.0,
+            int(s[2:4], 16) / 255.0,
+            int(s[4:6], 16) / 255.0,
+            int(s[6:8], 16) / 255.0,
+        )
+    raise ValueError(f"Invalid hex color: {hex_str!r}")
 
-    def __init__(self, scale: int = PIXEL_SCALE):
+
+PALETTE_RGBA: dict[str, tuple[float, float, float, float]] = {
+    k: ((0.0, 0.0, 0.0, 0.0) if k == "." else hex_to_rgba(v))
+    for k, v in PALETTE.items()
+}
+
+PARTICLE_ASCII: dict[str, list[str]] = {
+    "heart": [
+        ".OO.OO.",
+        "OPLOPRO",
+        "OPRRRRO",
+        ".ORRRO.",
+        "..ORO..",
+        "...O...",
+    ],
+    "sparkle": [
+        "..H..",
+        ".HWH.",
+        "HWWWH",
+        ".HWH.",
+        "..H..",
+    ],
+    "zzz": [
+        "OOOOO",
+        "..COO",
+        ".CO..",
+        "COO..",
+        "OOOOO",
+    ],
+    "mini_bee_0": [
+        "...WW...",
+        "..WCCW..",
+        ".OHYMSO.",
+        "OHYYMSMO",
+        "OAYYMSMO",
+        ".OOOOOO.",
+    ],
+    "mini_bee_1": [
+        "........",
+        "..WWWW..",
+        ".OHYMSO.",
+        "OHYYMSMO",
+        "OAYYMSMO",
+        ".OOOOOO.",
+    ],
+}
+
+
+def grid_to_color_spans(grid: list[list[str]]) -> list[tuple[int, int, int, str]]:
+    """
+    Convert non-transparent pixels of a 2D sprite grid into unscaled
+    horizontal color spans: (x_start, y, span_len, hex_color).
+    Consecutive pixels sharing the same color on a row are merged.
+    """
+    spans: list[tuple[int, int, int, str]] = []
+    for y, row in enumerate(grid):
+        span_start: int | None = None
+        span_col: str | None = None
+        for x, ch in enumerate(row):
+            if ch != ".":
+                col = PALETTE.get(ch, ch)
+                if span_start is None:
+                    span_start = x
+                    span_col = col
+                elif col != span_col:
+                    spans.append((span_start, y, x - span_start, span_col))
+                    span_start = x
+                    span_col = col
+            else:
+                if span_start is not None:
+                    spans.append((span_start, y, x - span_start, span_col))
+                    span_start = None
+                    span_col = None
+        if span_start is not None:
+            spans.append((span_start, y, len(row) - span_start, span_col))
+    return spans
+
+
+_PARTICLE_SPANS: dict[str, tuple[list[tuple[int, int, int, str]], int, int]] = {
+    kind: (
+        grid_to_color_spans([list(r) for r in rows]),
+        len(rows[0]) if rows else 0,
+        len(rows),
+    )
+    for kind, rows in PARTICLE_ASCII.items()
+}
+
+
+def get_particle_color_spans(kind: str) -> tuple[list[tuple[int, int, int, str]], int, int]:
+    """Return unscaled (spans, grid_w, grid_h) for a particle kind."""
+    return _PARTICLE_SPANS.get(kind, ([], 0, 0))
+
+
+class PixelArtRenderer:
+    """Builds and caches crisp nearest-neighbor sprites (tk.PhotoImage and/or color spans)."""
+
+    def __init__(self, scale: int = PIXEL_SCALE, use_tk: bool = True):
         self.scale = scale
-        self.cache = OrderedDict()
-        self.rects_cache = OrderedDict()
-        self.particle_cache = {}
-        self.particle_rects_cache = {}
+        self.use_tk = bool(use_tk)
+        self.cache: OrderedDict = OrderedDict()
+        self.rects_cache: OrderedDict = OrderedDict()
+        self.spans_cache: OrderedDict = OrderedDict()
+        self.particle_cache: dict = {}
+        self.particle_rects_cache: dict = {}
         self._init_particle_sprites()
 
     def set_scale(self, new_scale: int):
@@ -56,6 +183,21 @@ class PixelArtRenderer:
         self.particle_cache.clear()
         self.particle_rects_cache.clear()
         self._init_particle_sprites()
+
+    @staticmethod
+    def grid_to_color_spans(grid: list[list[str]]) -> list[tuple[int, int, int, str]]:
+        """Delegate to module-level grid_to_color_spans()."""
+        return grid_to_color_spans(grid)
+
+    def get_particle_color_spans(self, kind: str) -> tuple[list[tuple[int, int, int, str]], int, int]:
+        """Return unscaled (spans, grid_w, grid_h) for a particle kind."""
+        return get_particle_color_spans(kind)
+
+    @staticmethod
+    def _evict_lru(cache_dict: OrderedDict, limit: int = 256, drop: int = 64):
+        if len(cache_dict) >= limit:
+            for _ in range(min(drop, len(cache_dict))):
+                cache_dict.popitem(last=False)
 
     def grid_to_rects(self, grid: list[list[str]], scale: int | None = None) -> list[tuple[int, int, int, int]]:
         """
@@ -80,6 +222,8 @@ class PixelArtRenderer:
         return rects
 
     def grid_to_photo(self, grid: list[list[str]], scale: int | None = None) -> tk.PhotoImage:
+        if tk is None:
+            raise RuntimeError("tkinter is required for PhotoImage rendering")
         sc = scale or self.scale
         h = len(grid)
         w = len(grid[0]) if h > 0 else 0
@@ -106,77 +250,15 @@ class PixelArtRenderer:
 
     def _init_particle_sprites(self):
         p_scale = max(2, self.scale - 1)
-        heart_ascii = [
-            ".OO.OO.",
-            "OPLOPRO",
-            "OPRRRRO",
-            ".ORRRO.",
-            "..ORO..",
-            "...O...",
-        ]
-        self.particle_cache["heart"] = self.grid_to_photo([list(r) for r in heart_ascii], scale=p_scale)
-        self.particle_rects_cache["heart"] = (
-            self.grid_to_rects([list(r) for r in heart_ascii], scale=p_scale),
-            len(heart_ascii[0]) * p_scale,
-            len(heart_ascii) * p_scale,
-        )
-
-        sparkle_ascii = [
-            "..H..",
-            ".HWH.",
-            "HWWWH",
-            ".HWH.",
-            "..H..",
-        ]
-        self.particle_cache["sparkle"] = self.grid_to_photo([list(r) for r in sparkle_ascii], scale=p_scale)
-        self.particle_rects_cache["sparkle"] = (
-            self.grid_to_rects([list(r) for r in sparkle_ascii], scale=p_scale),
-            len(sparkle_ascii[0]) * p_scale,
-            len(sparkle_ascii) * p_scale,
-        )
-
-        zzz_ascii = [
-            "OOOOO",
-            "..COO",
-            ".CO..",
-            "COO..",
-            "OOOOO",
-        ]
-        self.particle_cache["zzz"] = self.grid_to_photo([list(r) for r in zzz_ascii], scale=p_scale)
-        self.particle_rects_cache["zzz"] = (
-            self.grid_to_rects([list(r) for r in zzz_ascii], scale=p_scale),
-            len(zzz_ascii[0]) * p_scale,
-            len(zzz_ascii) * p_scale,
-        )
-
-        mini_bee_0 = [
-            "...WW...",
-            "..WCCW..",
-            ".OHYMSO.",
-            "OHYYMSMO",
-            "OAYYMSMO",
-            ".OOOOOO.",
-        ]
-        mini_bee_1 = [
-            "........",
-            "..WWWW..",
-            ".OHYMSO.",
-            "OHYYMSMO",
-            "OAYYMSMO",
-            ".OOOOOO.",
-        ]
-        self.particle_cache["mini_bee_0"] = self.grid_to_photo([list(r) for r in mini_bee_0], scale=p_scale)
-        self.particle_rects_cache["mini_bee_0"] = (
-            self.grid_to_rects([list(r) for r in mini_bee_0], scale=p_scale),
-            len(mini_bee_0[0]) * p_scale,
-            len(mini_bee_0) * p_scale,
-        )
-        self.particle_cache["mini_bee_1"] = self.grid_to_photo([list(r) for r in mini_bee_1], scale=p_scale)
-        self.particle_rects_cache["mini_bee_1"] = (
-            self.grid_to_rects([list(r) for r in mini_bee_1], scale=p_scale),
-            len(mini_bee_1[0]) * p_scale,
-            len(mini_bee_1) * p_scale,
-        )
+        for kind, ascii_rows in PARTICLE_ASCII.items():
+            grid = [list(r) for r in ascii_rows]
+            if self.use_tk:
+                self.particle_cache[kind] = self.grid_to_photo(grid, scale=p_scale)
+            self.particle_rects_cache[kind] = (
+                self.grid_to_rects(grid, scale=p_scale),
+                (len(ascii_rows[0]) if ascii_rows else 0) * p_scale,
+                len(ascii_rows) * p_scale,
+            )
 
     @staticmethod
     def _normalize_key(
@@ -212,7 +294,7 @@ class PixelArtRenderer:
 
         return (eff_mode, eff_wing, eye_state, eff_dx, eff_dy, eff_prop, eff_leg)
 
-    def get_bee_sprite(
+    def build_bee_grid(
         self,
         eff_mode: str,
         wing_frame: int,
@@ -221,15 +303,13 @@ class PixelArtRenderer:
         look_dy: int,
         prop_frame: int,
         leg_shift: int,
-    ) -> tk.PhotoImage:
-        key = self._normalize_key(
-            eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+    ) -> list[list[str]]:
+        """Build the 44x40 2D ASCII pixel grid for a bee pose and mode."""
+        eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift = (
+            self._normalize_key(
+                eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+            )
         )
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            if key in self.rects_cache:
-                self.rects_cache.move_to_end(key)
-            return self.cache[key]
 
         W, H = 44, 40
         g = [["." for _ in range(W)] for _ in range(H)]
@@ -587,16 +667,63 @@ class PixelArtRenderer:
             ]
             draw_sprite(bx + 6, 1, warn)
 
+        return g
+
+    def get_bee_color_spans(
+        self,
+        eff_mode: str,
+        wing_frame: int,
+        eye_state: str,
+        look_dx: int,
+        look_dy: int,
+        prop_frame: int,
+        leg_shift: int,
+    ) -> list[tuple[int, int, int, str]]:
+        """Return cached unscaled (x_start, y, span_len, hex_color) spans for the 44x40 bee."""
+        key = self._normalize_key(
+            eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+        )
+        if key not in self.spans_cache:
+            g = self.build_bee_grid(*key)
+            self._evict_lru(self.spans_cache)
+            self.spans_cache[key] = self.grid_to_color_spans(g)
+        else:
+            self.spans_cache.move_to_end(key)
+        return self.spans_cache[key]
+
+    def get_bee_sprite(
+        self,
+        eff_mode: str,
+        wing_frame: int,
+        eye_state: str,
+        look_dx: int,
+        look_dy: int,
+        prop_frame: int,
+        leg_shift: int,
+    ) -> tk.PhotoImage:
+        if not self.use_tk:
+            raise RuntimeError("get_bee_sprite() requires use_tk=True")
+        key = self._normalize_key(
+            eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+        )
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            if key in self.rects_cache:
+                self.rects_cache.move_to_end(key)
+            if key in self.spans_cache:
+                self.spans_cache.move_to_end(key)
+            return self.cache[key]
+
+        g = self.build_bee_grid(*key)
         photo = self.grid_to_photo(g)
         rects = self.grid_to_rects(g)
-        while len(self.cache) >= 256:
-            for _ in range(64):
-                if self.cache:
-                    self.cache.popitem(last=False)
-                if self.rects_cache:
-                    self.rects_cache.popitem(last=False)
+        self._evict_lru(self.cache)
+        self._evict_lru(self.rects_cache)
         self.cache[key] = photo
         self.rects_cache[key] = rects
+        if key not in self.spans_cache:
+            self._evict_lru(self.spans_cache)
+            self.spans_cache[key] = self.grid_to_color_spans(g)
         return photo
 
     def get_bee_rects(
@@ -613,8 +740,15 @@ class PixelArtRenderer:
             eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
         )
         if key not in self.rects_cache:
-            self.get_bee_sprite(
-                eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
-            )
-        self.rects_cache.move_to_end(key)
+            if self.use_tk:
+                self.get_bee_sprite(*key)
+            else:
+                g = self.build_bee_grid(*key)
+                self._evict_lru(self.rects_cache)
+                self.rects_cache[key] = self.grid_to_rects(g)
+                if key not in self.spans_cache:
+                    self._evict_lru(self.spans_cache)
+                    self.spans_cache[key] = self.grid_to_color_spans(g)
+        else:
+            self.rects_cache.move_to_end(key)
         return self.rects_cache.get(key, [])
