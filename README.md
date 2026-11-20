@@ -21,7 +21,22 @@ It runs as an always-on-top desktop widget and reacts in real time (with zero to
 
 ## Installation
 
-Clone this repository as `.agents` in your workspace root (or inside `~/.gemini/config/plugins/antigravitybee`):
+### Option 1: Global Installation (Recommended — Works in ALL Folders & Projects)
+
+Install the plugin once into your global Antigravity configuration (`~/.gemini/config/plugins/antigravitybee`) so the bee is available everywhere, no matter which directory you open Antigravity in:
+
+- **Linux / macOS**:
+  ```bash
+  git clone https://github.com/guikksou/antigravitybee.git ~/.gemini/config/plugins/antigravitybee
+  ```
+- **Windows (PowerShell)**:
+  ```powershell
+  git clone https://github.com/guikksou/antigravitybee.git "$HOME\.gemini\config\plugins\antigravitybee"
+  ```
+
+### Option 2: Per-Project Installation (Single Workspace Only)
+
+If you only want the bee inside a specific project folder, clone it as `.agents` at that workspace's root:
 
 ```bash
 git clone https://github.com/guikksou/antigravitybee.git .agents
