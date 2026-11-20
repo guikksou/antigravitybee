@@ -41,7 +41,9 @@ class PixelArtRenderer:
     def __init__(self, scale: int = PIXEL_SCALE):
         self.scale = scale
         self.cache = {}
+        self.rects_cache = {}
         self.particle_cache = {}
+        self.particle_rects_cache = {}
         self._init_particle_sprites()
 
     def set_scale(self, new_scale: int):
@@ -49,8 +51,32 @@ class PixelArtRenderer:
             return
         self.scale = new_scale
         self.cache.clear()
+        self.rects_cache.clear()
         self.particle_cache.clear()
+        self.particle_rects_cache.clear()
         self._init_particle_sprites()
+
+    def grid_to_rects(self, grid: list[list[str]], scale: int | None = None) -> list[tuple[int, int, int, int]]:
+        """
+        Convert non-transparent pixels of a 2D sprite grid into a list of
+        (dx, dy, width, height) rectangles relative to the sprite's top-left corner.
+        Used for X11 XShape window transparency on Linux.
+        """
+        sc = scale or self.scale
+        rects = []
+        for y, row in enumerate(grid):
+            x_start = None
+            for x, ch in enumerate(row):
+                if ch != ".":
+                    if x_start is None:
+                        x_start = x
+                else:
+                    if x_start is not None:
+                        rects.append((x_start * sc, y * sc, (x - x_start) * sc, sc))
+                        x_start = None
+            if x_start is not None:
+                rects.append((x_start * sc, y * sc, (len(row) - x_start) * sc, sc))
+        return rects
 
     def grid_to_photo(self, grid: list[list[str]], scale: int | None = None) -> tk.PhotoImage:
         sc = scale or self.scale
@@ -88,6 +114,11 @@ class PixelArtRenderer:
             "...O...",
         ]
         self.particle_cache["heart"] = self.grid_to_photo([list(r) for r in heart_ascii], scale=p_scale)
+        self.particle_rects_cache["heart"] = (
+            self.grid_to_rects([list(r) for r in heart_ascii], scale=p_scale),
+            len(heart_ascii[0]) * p_scale,
+            len(heart_ascii) * p_scale,
+        )
 
         sparkle_ascii = [
             "..H..",
@@ -97,6 +128,11 @@ class PixelArtRenderer:
             "..H..",
         ]
         self.particle_cache["sparkle"] = self.grid_to_photo([list(r) for r in sparkle_ascii], scale=p_scale)
+        self.particle_rects_cache["sparkle"] = (
+            self.grid_to_rects([list(r) for r in sparkle_ascii], scale=p_scale),
+            len(sparkle_ascii[0]) * p_scale,
+            len(sparkle_ascii) * p_scale,
+        )
 
         zzz_ascii = [
             "OOOOO",
@@ -106,6 +142,11 @@ class PixelArtRenderer:
             "OOOOO",
         ]
         self.particle_cache["zzz"] = self.grid_to_photo([list(r) for r in zzz_ascii], scale=p_scale)
+        self.particle_rects_cache["zzz"] = (
+            self.grid_to_rects([list(r) for r in zzz_ascii], scale=p_scale),
+            len(zzz_ascii[0]) * p_scale,
+            len(zzz_ascii) * p_scale,
+        )
 
         mini_bee_0 = [
             "...WW...",
@@ -124,7 +165,17 @@ class PixelArtRenderer:
             ".OOOOOO.",
         ]
         self.particle_cache["mini_bee_0"] = self.grid_to_photo([list(r) for r in mini_bee_0], scale=p_scale)
+        self.particle_rects_cache["mini_bee_0"] = (
+            self.grid_to_rects([list(r) for r in mini_bee_0], scale=p_scale),
+            len(mini_bee_0[0]) * p_scale,
+            len(mini_bee_0) * p_scale,
+        )
         self.particle_cache["mini_bee_1"] = self.grid_to_photo([list(r) for r in mini_bee_1], scale=p_scale)
+        self.particle_rects_cache["mini_bee_1"] = (
+            self.grid_to_rects([list(r) for r in mini_bee_1], scale=p_scale),
+            len(mini_bee_1[0]) * p_scale,
+            len(mini_bee_1) * p_scale,
+        )
 
     def get_bee_sprite(
         self,
@@ -497,7 +548,23 @@ class PixelArtRenderer:
             draw_sprite(bx + 6, 1, warn)
 
         photo = self.grid_to_photo(g)
+        rects = self.grid_to_rects(g)
         if len(self.cache) > 256:
             self.cache.clear()
+            self.rects_cache.clear()
         self.cache[key] = photo
+        self.rects_cache[key] = rects
         return photo
+
+    def get_bee_rects(
+        self,
+        eff_mode: str,
+        wing_frame: int,
+        eye_state: str,
+        look_dx: int,
+        look_dy: int,
+        prop_frame: int,
+        leg_shift: int,
+    ) -> list[tuple[int, int, int, int]]:
+        key = (eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift)
+        return self.rects_cache.get(key, [])

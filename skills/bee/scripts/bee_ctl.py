@@ -7,6 +7,7 @@ Usage:
   python bee_ctl.py start [detail]
   python bee_ctl.py stop [--disable-auto]
   python bee_ctl.py auto [on|off]
+  python bee_ctl.py size <small|medium|large|xlarge>
   python bee_ctl.py mode <mode> [detail]
   python bee_ctl.py honey
   python bee_ctl.py status
@@ -78,10 +79,19 @@ def main():
         ensure_bee_running(force=True)
         print("Fed honey to the Bee!")
     elif cmd == "size":
-        sz = args[1].lower() if len(args) > 1 else "medium"
-        alias = {"petit": "small", "moyen": "medium", "grand": "large"}
+        sz = " ".join(args[1:]).lower().strip() if len(args) > 1 else "medium"
+        alias = {
+            "petit": "small",
+            "moyen": "medium",
+            "grand": "large",
+            "tres grand": "xlarge",
+            "très grand": "xlarge",
+            "extra large": "xlarge",
+            "extralarge": "xlarge",
+            "xl": "xlarge",
+        }
         sz = alias.get(sz, sz)
-        if sz not in ("small", "medium", "large"):
+        if sz not in ("small", "medium", "large", "xlarge"):
             sz = "medium"
         cfg = load_config()
         cfg["size"] = sz
@@ -105,6 +115,7 @@ def main():
                     "running": running,
                     "pid": pid,
                     "auto_launch": cfg.get("auto_launch", True),
+                    "size": cfg.get("size", "medium"),
                     "state": state,
                 },
                 indent=2,

@@ -12,19 +12,19 @@ import random
 import sys
 import time
 import tkinter as tk
-from pathlib import Path
 
 from platform_adapter import (
+    IS_LINUX,
     TRANSPARENT_KEY,
     acquire_single_instance_lock,
+    apply_window_shape_rects,
     configure_overlay_window,
     init_dpi_awareness,
     is_pid_alive,
     play_platform_chime,
     set_window_opacity,
-    terminate_pid,
 )
-from pixel_sprites import PIXEL_SCALE, PixelArtRenderer
+from pixel_sprites import PixelArtRenderer
 from state_sync import (
     PID_FILE,
     STATE_DIR,
@@ -44,6 +44,7 @@ SIZE_PRESETS = {
     "small": {"scale": 3, "width": 200, "height": 180},
     "medium": {"scale": 4, "width": 240, "height": 225},
     "large": {"scale": 5, "width": 290, "height": 270},
+    "xlarge": {"scale": 7, "width": 390, "height": 360},
 }
 
 
@@ -130,7 +131,10 @@ class KawaiiBeeWidget:
         self.canvas.bind("<B1-Motion>", self.on_left_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_left_up)
         self.canvas.bind("<Double-Button-1>", self.on_double_click)
-        self.canvas.bind("<Button-3>", self.on_right_click)
+        if IS_LINUX:
+            self.canvas.bind("<ButtonRelease-3>", self.on_right_click)
+        else:
+            self.canvas.bind("<Button-3>", self.on_right_click)
         self.canvas.bind("<Enter>", self.on_mouse_enter)
         self.canvas.bind("<Leave>", self.on_mouse_leave)
         self.canvas.bind("<Motion>", self.on_mouse_move)
@@ -139,7 +143,8 @@ class KawaiiBeeWidget:
         cur_st = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
         if cur_st.get("host_pid", 0) > 0:
             self.host_pid = int(cur_st["host_pid"])
-        if not cur_st or cur_st.get("mode", "") in ("quit", "quit_disable", ""):
+        init_mode = cur_st.get("mode", "") if cur_st else ""
+        if not cur_st or init_mode in ("quit", "quit_disable", "") or init_mode.startswith("size:"):
             write_state("idle", "Idle", swarm_active=False)
         self._apply_opacity()
 
@@ -234,6 +239,7 @@ class KawaiiBeeWidget:
         size_menu.add_command(label="Small (3x)", command=lambda: self.set_size("small"))
         size_menu.add_command(label="Medium (4x)", command=lambda: self.set_size("medium"))
         size_menu.add_command(label="Large (5x)", command=lambda: self.set_size("large"))
+        size_menu.add_command(label="Extra Large (7x)", command=lambda: self.set_size("xlarge"))
         self.menu.add_cascade(label="Widget Size", menu=size_menu)
 
         self.menu.add_separator()
@@ -293,10 +299,13 @@ class KawaiiBeeWidget:
         self.feed_honey()
 
     def on_right_click(self, event):
-        try:
+        if IS_LINUX:
             self.menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.menu.grab_release()
+        else:
+            try:
+                self.menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.menu.grab_release()
 
     def on_mouse_enter(self, event):
         self.is_hovered = True
@@ -487,8 +496,8 @@ class KawaiiBeeWidget:
                         return
                     if new_mode.startswith("size:"):
                         self.set_size(new_mode.split(":", 1)[1])
-                        return
-                    self.set_mode(new_mode, new_detail)
+                    else:
+                        self.set_mode(new_mode, new_detail)
         except Exception:
             pass
 
@@ -639,11 +648,53 @@ class KawaiiBeeWidget:
         self._update_and_draw_particles()
 
         # 6. Retro Pixel-Art RPG Dialogue Bubble (ONLY shown on mouse hover)
+        bub_rects = None
         if self.is_hovered:
             txt = self.bubble_text if now < self.bubble_until and self.bubble_text else (self.detail or "Ready")
             offset_top = (16 * sc) if eff_mode in ("needs_input", "error") else (12 * sc)
             bub_y = by - offset_top
-            self._draw_pixel_speech_box(bx, max(18, bub_y), txt, eff_mode)
+            bub_rects = self._draw_pixel_speech_box(bx, bub_y, txt, eff_mode)
+
+        # 7. Linux X11 XShape pixel-perfect transparency mask (no-op on Windows)
+        if IS_LINUX:
+            shape_rects = [
+                (cx - shadow_w, shadow_y, 2 * shadow_w, sc)
+            ]
+            # Main bee sprite top-left offset (44x40 base grid anchored at center)
+            bee_x0 = bx - 22 * sc
+            bee_y0 = by - 20 * sc
+            for rx, ry, rw, rh in self.renderer.get_bee_rects(
+                eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+            ):
+                shape_rects.append((bee_x0 + rx, bee_y0 + ry, rw, rh))
+
+            # Mini bees in swarm mode
+            if eff_mode == "swarm":
+                mb_key = f"mini_bee_{(self.frame_count // 3) % 2}"
+                mb_rects, mb_w, mb_h = self.renderer.particle_rects_cache.get(mb_key, ([], 0, 0))
+                for i in range(3):
+                    angle = t * 2.6 + i * (2 * math.pi / 3)
+                    z = math.sin(angle)
+                    mx = int((bx + math.cos(angle) * (15.5 * sc)) // sc) * sc
+                    my = int((by + z * (5.0 * sc)) // sc) * sc
+                    mx0 = mx - mb_w // 2
+                    my0 = my - mb_h // 2
+                    for rx, ry, rw, rh in mb_rects:
+                        shape_rects.append((mx0 + rx, my0 + ry, rw, rh))
+
+            # Active particles
+            for p in self.particles:
+                p_rects, pw, ph = self.renderer.particle_rects_cache.get(p["kind"], ([], 0, 0))
+                px = int(p["x"] // 2) * 2 - pw // 2
+                py = int(p["y"] // 2) * 2 - ph // 2
+                for rx, ry, rw, rh in p_rects:
+                    shape_rects.append((px + rx, py + ry, rw, rh))
+
+            # Speech bubble
+            if bub_rects:
+                shape_rects.extend(bub_rects)
+
+            apply_window_shape_rects(self.root, shape_rects)
 
         self.root.after(16, self.animate)
 
@@ -696,10 +747,43 @@ class KawaiiBeeWidget:
             inner_border = "#F59E0B"
             text_col = "#92400E"
 
+        # Create the text item first to measure its true rendered pixel bounding box
+        # across different DPI settings (e.g. 96 DPI on Windows vs 192 DPI on Linux).
+        font_px = -max(12, int(self.pixel_scale * 3.2))
+        text_id = self.canvas.create_text(
+            x, y,
+            text=text,
+            fill=text_col,
+            font=("Consolas", font_px, "bold"),
+        )
+        bbox = self.canvas.bbox(text_id)
+        if bbox:
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+        else:
+            tw = len(text) * abs(font_px)
+            th = abs(font_px) + 4
+
         max_w = self.width - 8
-        w = max(108, min(max_w, len(text) * 7 + 24))
-        w = (w // 4) * 4
-        h = 28
+        # If the rendered text is still wider than the widget canvas, trim characters
+        while tw + 24 > max_w and len(text) > 6:
+            text = text[:-3] + ".."
+            self.canvas.itemconfigure(text_id, text=text)
+            bbox = self.canvas.bbox(text_id)
+            if bbox:
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+            else:
+                break
+
+        w = max(84, min(max_w, tw + 24))
+        w = ((w + 3) // 4) * 4
+        h = max(28, ((th + 16 + 3) // 4) * 4)
+
+        # Keep the entire speech box within the top edge of the canvas
+        y = max(h // 2 + 2, y)
+        self.canvas.coords(text_id, x, y)
+
         x0, y0 = int(x - w // 2), int(y - h // 2)
         x1, y1 = int(x + w // 2), int(y + h // 2)
 
@@ -721,12 +805,15 @@ class KawaiiBeeWidget:
         self.canvas.create_rectangle(x - 4, y1 - 6, x + 4, y1 + 2, fill=bg_col, outline="")
         self.canvas.create_rectangle(x - 2, y1 + 2, x + 2, y1 + 4, fill=bg_col, outline="")
 
-        self.canvas.create_text(
-            x, y,
-            text=text,
-            fill=text_col,
-            font=("Consolas", 9, "bold"),
-        )
+        # Raise the measured text above the bubble background rectangles
+        self.canvas.tag_raise(text_id)
+        return [
+            (x0 + 4, y0, (x1 - 4) - (x0 + 4), y1 - y0),
+            (x0, y0 + 4, x1 - x0, (y1 - 4) - (y0 + 4)),
+            (x - 8, y1, 16, 3),
+            (x - 5, y1 + 3, 10, 3),
+            (x - 2, y1 + 6, 4, 3),
+        ]
 
     def run(self):
         self.root.mainloop()

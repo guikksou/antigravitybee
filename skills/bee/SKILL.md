@@ -30,10 +30,10 @@ Use the CLI controller [bee_ctl.py](./scripts/bee_ctl.py) via `run_command`:
    python "<path_to_skill>/scripts/bee_ctl.py" honey
    ```
 
-4. **Change widget size** (`/bee size <small|medium|large>`):
-   Supported sizes: `small` (`3x`), `medium` (`4x`), `large` (`5x`).
+4. **Change widget size** (`/bee size <small|medium|large|xlarge>`):
+   Supported sizes: `small` (`3x`), `medium` (`4x`), `large` (`5x`), `xlarge` (`7x`).
    ```bash
-   python "<path_to_skill>/scripts/bee_ctl.py" size <small|medium|large>
+   python "<path_to_skill>/scripts/bee_ctl.py" size <small|medium|large|xlarge>
    ```
 
 5. **Manually set costume / mode** (`/bee mode <mode>`):

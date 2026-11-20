@@ -1,5 +1,7 @@
 {
   "name": "antigravity-bee",
+  "version": "0.1.0",
+  "description": "A lightweight, 60-FPS pixel-art desktop companion widget for Google Antigravity on Windows and Linux.",
   "author": {
     "name": "guikksou",
     "url": "https://github.com/guikksou"

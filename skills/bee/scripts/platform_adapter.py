@@ -15,7 +15,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import tkinter as tk
 from pathlib import Path
 
@@ -24,6 +23,144 @@ IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 
 _SINGLETON_HANDLE = None
+_X11_LIB = None
+_XEXT_LIB = None
+_X11_DISPLAY = None
+_X11_INIT_DONE = False
+_X11_TOPLEVEL_CACHE = {}
+
+
+class _XRectangle(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_short),
+        ("y", ctypes.c_short),
+        ("width", ctypes.c_ushort),
+        ("height", ctypes.c_ushort),
+    ]
+
+
+def _ensure_x11_shape():
+    """Lazily initialize libX11 and libXext for XShape non-rectangular window masks on Linux."""
+    global _X11_LIB, _XEXT_LIB, _X11_DISPLAY, _X11_INIT_DONE
+    if _X11_INIT_DONE:
+        return _X11_DISPLAY is not None and _XEXT_LIB is not None
+    _X11_INIT_DONE = True
+    if not IS_LINUX:
+        return False
+    try:
+        from ctypes.util import find_library
+
+        x11_name = find_library("X11") or "libX11.so.6"
+        xext_name = find_library("Xext") or "libXext.so.6"
+        _X11_LIB = ctypes.cdll.LoadLibrary(x11_name)
+        _XEXT_LIB = ctypes.cdll.LoadLibrary(xext_name)
+
+        _X11_LIB.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        _X11_LIB.XOpenDisplay.restype = ctypes.c_void_p
+        _X11_LIB.XFlush.argtypes = [ctypes.c_void_p]
+        _X11_LIB.XFlush.restype = ctypes.c_int
+        _X11_LIB.XQueryTree.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        _X11_LIB.XQueryTree.restype = ctypes.c_int
+        _X11_LIB.XFree.argtypes = [ctypes.c_void_p]
+        _X11_LIB.XFree.restype = ctypes.c_int
+
+        _XEXT_LIB.XShapeCombineRectangles.argtypes = [
+            ctypes.c_void_p,  # Display*
+            ctypes.c_ulong,   # XID (Window)
+            ctypes.c_int,     # dest_kind (ShapeBounding=0, ShapeInput=2)
+            ctypes.c_int,     # x_off
+            ctypes.c_int,     # y_off
+            ctypes.POINTER(_XRectangle),
+            ctypes.c_int,     # n_rects
+            ctypes.c_int,     # op (ShapeSet=0)
+            ctypes.c_int,     # ordering (Unsorted=0)
+        ]
+        _XEXT_LIB.XShapeCombineRectangles.restype = None
+
+        _X11_DISPLAY = _X11_LIB.XOpenDisplay(None)
+        return bool(_X11_DISPLAY)
+    except Exception:
+        _X11_DISPLAY = None
+        return False
+
+
+def _get_x11_toplevel_and_inner(root: tk.Tk) -> list[int]:
+    """
+    On Linux/Tkinter, root.winfo_id() returns the inner wrapper XID (e.g. 0x2a00009),
+    while the actual X11 TopLevel window managed by the compositor/WM is its parent XID (e.g. 0x2a0000a).
+    Returns both XIDs so XShape applies cleanly to the outer frame and inner wrapper.
+    """
+    inner_xid = root.winfo_id()
+    if not inner_xid:
+        return []
+    if inner_xid in _X11_TOPLEVEL_CACHE:
+        return _X11_TOPLEVEL_CACHE[inner_xid]
+    targets = [inner_xid]
+    try:
+        wm_frame_str = root.wm_frame()
+        if wm_frame_str and wm_frame_str != "0x0":
+            outer_xid = int(wm_frame_str, 16)
+            if outer_xid and outer_xid != inner_xid:
+                targets.append(outer_xid)
+    except Exception:
+        pass
+    if len(targets) == 1 and _X11_LIB and _X11_DISPLAY:
+        try:
+            root_ret = ctypes.c_ulong()
+            parent_ret = ctypes.c_ulong()
+            children_ret = ctypes.POINTER(ctypes.c_ulong)()
+            nchildren_ret = ctypes.c_uint()
+            if _X11_LIB.XQueryTree(
+                _X11_DISPLAY,
+                inner_xid,
+                ctypes.byref(root_ret),
+                ctypes.byref(parent_ret),
+                ctypes.byref(children_ret),
+                ctypes.byref(nchildren_ret),
+            ):
+                if children_ret:
+                    _X11_LIB.XFree(children_ret)
+                if parent_ret.value and parent_ret.value != root_ret.value:
+                    targets.append(parent_ret.value)
+        except Exception:
+            pass
+    if len(targets) > 1:
+        _X11_TOPLEVEL_CACHE[inner_xid] = targets
+    return targets
+
+
+def apply_window_shape_rects(root: tk.Tk, rects: list[tuple[int, int, int, int]]):
+    """
+    On Linux (X11/XWayland), apply an exact pixel-art non-rectangular bounding mask
+    to both the outer TopLevel window and inner Tk wrapper so the background is 100%
+    transparent without any black box or unredrawn artifacts.
+    No-op on Windows (which uses -transparentcolor natively).
+    """
+    if not IS_LINUX or not _ensure_x11_shape():
+        return
+    try:
+        targets = _get_x11_toplevel_and_inner(root)
+        if not targets:
+            return
+        n = len(rects)
+        if n == 0:
+            arr = (_XRectangle * 1)((0, 0, 1, 1))
+            n = 1
+        else:
+            arr = (_XRectangle * n)(*rects)
+        # ShapeBounding = 0, ShapeSet = 0, Unsorted = 0
+        for xid in targets:
+            _XEXT_LIB.XShapeCombineRectangles(_X11_DISPLAY, xid, 0, 0, 0, arr, n, 0, 0)
+        _X11_LIB.XFlush(_X11_DISPLAY)
+    except Exception:
+        pass
 
 
 def acquire_single_instance_lock(lock_path: Path) -> bool:
@@ -53,16 +190,6 @@ def acquire_single_instance_lock(lock_path: Path) -> bool:
             return True
         except Exception:
             return False
-
-if IS_WINDOWS:
-    try:
-        import winsound
-        HAS_WINSOUND = True
-    except ImportError:
-        HAS_WINSOUND = False
-else:
-    HAS_WINSOUND = False
-
 
 def init_dpi_awareness():
     """Enable crisp high-DPI rendering before Tk root creation."""

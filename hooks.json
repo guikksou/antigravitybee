@@ -4,14 +4,14 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "python ./skills/bee/scripts/bee_hook.py",
+        "command": "python ./skills/bee/scripts/bee_hook.py || python3 ./skills/bee/scripts/bee_hook.py",
         "timeout": 5
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python ./skills/bee/scripts/bee_hook.py",
+        "command": "python ./skills/bee/scripts/bee_hook.py || python3 ./skills/bee/scripts/bee_hook.py",
         "timeout": 5
       }
     ],
@@ -21,7 +21,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python ./skills/bee/scripts/bee_hook.py",
+            "command": "python ./skills/bee/scripts/bee_hook.py || python3 ./skills/bee/scripts/bee_hook.py",
             "timeout": 5
           }
         ]
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python ./skills/bee/scripts/bee_hook.py",
+            "command": "python ./skills/bee/scripts/bee_hook.py || python3 ./skills/bee/scripts/bee_hook.py",
             "timeout": 5
           }
         ]
@@ -42,7 +42,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "python ./skills/bee/scripts/bee_hook.py",
+        "command": "python ./skills/bee/scripts/bee_hook.py || python3 ./skills/bee/scripts/bee_hook.py",
         "timeout": 5
       }
     ]
