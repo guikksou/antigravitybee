@@ -293,9 +293,10 @@ def apply_window_shape_rects(root: tk.Tk, rects: list[tuple[int, int, int, int]]
     if not IS_LINUX or not _ensure_x11_shape():
         return False
     try:
-        root.update_idletasks()
         if not root.winfo_ismapped():
-            return False
+            root.update_idletasks()
+            if not root.winfo_ismapped():
+                return False
         targets = _get_x11_toplevel_and_inner(root)
         if not targets:
             return False

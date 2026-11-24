@@ -126,8 +126,17 @@ class KawaiiBeeWidget:
         self._anim_after_id = None
         self._leave_after_id = None
         self._last_shape_key = None
+        self._last_render_key = None
+        self._last_dyn_key = None
+        self._last_bub_rects = None
+        self._shadow_id = None
+        self._bee_img_id = None
+        self._last_shadow_coords = None
+        self._last_bee_pos = None
+        self._last_bee_sprite = None
         self._cached_look_dx = 0
         self._cached_look_dy = 0
+        self._last_pointer_poll = 0.0
         self._bubble_measure_cache = {}
         self._drag_moved_this_frame = False
 
@@ -155,7 +164,8 @@ class KawaiiBeeWidget:
         self.blink_until = 0.0
 
         self.t0 = time.time()
-        self.frame_count = 0
+        self._last_anim_time = self.t0
+        self._last_ambient_particle_time = 0.0
 
         # Bindings
         self.canvas.bind("<ButtonPress-1>", self.on_left_down)
@@ -172,6 +182,12 @@ class KawaiiBeeWidget:
 
         self._build_context_menu()
         cur_st = read_state()
+        self._last_state_data = cur_st
+        try:
+            if STATE_FILE.exists():
+                self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
+        except Exception:
+            pass
         new_host_pid = int(cur_st.get("host_pid", 0) or 0) if cur_st else 0
         if new_host_pid > 0 and is_pid_alive(new_host_pid):
             self.host_pid = new_host_pid
@@ -180,6 +196,12 @@ class KawaiiBeeWidget:
         init_mode = cur_st.get("mode", "") if cur_st else ""
         if not cur_st or init_mode in ("quit", "quit_disable", "", "honey") or init_mode.startswith("size:"):
             write_state("idle", "Idle", swarm_active=False, host_pid=self.host_pid)
+            self._last_state_data = read_state()
+            try:
+                if STATE_FILE.exists():
+                    self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
+            except Exception:
+                pass
         self._apply_opacity()
 
         self.poll_state()
@@ -252,6 +274,15 @@ class KawaiiBeeWidget:
         self.renderer.set_scale(self.pixel_scale)
         self.canvas.configure(width=self.width, height=self.height)
         self.win_x, self.win_y = self._clamp_position(self.win_x, self.win_y)
+        self.canvas.delete("all")
+        self._shadow_id = None
+        self._bee_img_id = None
+        self._last_shadow_coords = None
+        self._last_bee_pos = None
+        self._last_bee_sprite = None
+        self._last_render_key = None
+        self._last_dyn_key = None
+        self._last_bub_rects = None
         self._last_shape_key = None
         self.root.geometry(f"{self.width}x{self.height}+{self.win_x}+{self.win_y}")
         self._persist_config()
@@ -364,6 +395,12 @@ class KawaiiBeeWidget:
             if self.mode in ("needs_input", "done", "error"):
                 self.set_mode("idle", "Idle", manual=True)
                 write_state("idle", "Idle")
+                self._last_state_data = read_state()
+                try:
+                    if STATE_FILE.exists():
+                        self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
+                except Exception:
+                    pass
                 self.bubble_until = 0.0
                 self.spawn_particles("sparkle", 5)
             else:
@@ -613,6 +650,7 @@ class KawaiiBeeWidget:
                     data = read_state()
                     if data:
                         self.last_state_mtime_ns = mtime_ns
+                        self._last_state_data = data
                         new_host_pid = int(data.get("host_pid", 0) or 0)
                         if new_host_pid > 0 and is_pid_alive(new_host_pid):
                             self.host_pid = new_host_pid
@@ -629,11 +667,13 @@ class KawaiiBeeWidget:
                         if new_mode.startswith("size:"):
                             self.set_size(new_mode.split(":", 1)[1])
                             write_state(self.mode, self.detail or "Idle")
+                            self._last_state_data = read_state()
                             if STATE_FILE.exists():
                                 self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
                         elif new_mode == "honey":
                             self.set_mode(new_mode, new_detail)
                             write_state(self.mode, self.detail or "Idle")
+                            self._last_state_data = read_state()
                             if STATE_FILE.exists():
                                 self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
                         else:
@@ -647,7 +687,7 @@ class KawaiiBeeWidget:
             return
 
         # Live transcript polling
-        t_res = self.transcript_watcher.poll(now)
+        t_res = self.transcript_watcher.poll(now, state_data=self._last_state_data)
         if t_res is not None:
             self.set_mode(t_res[0], t_res[1])
 
@@ -669,15 +709,16 @@ class KawaiiBeeWidget:
         if not self._quitting:
             self._poll_after_id = self.root.after(250, self.poll_state)
 
-    # -------------------- 60 FPS Pixel-Art Animation Loop --------------------
+    # -------------------- Adaptive Pixel-Art Animation Loop --------------------
 
     def animate(self):
         if self._quitting:
             return
         now = time.time()
         t = now - self.t0
-        self.frame_count += 1
-        self.canvas.delete("all")
+        dt = min(max(0.0, now - self._last_anim_time), 0.25)
+        self._last_anim_time = now
+        dt_60 = dt * 60.0
 
         eff_mode = self.mode
         if self.is_dragging:
@@ -712,19 +753,29 @@ class KawaiiBeeWidget:
         bx = cx + bob_x
         by = base_cy + bob_y
 
-        # Ambient pixel particles
-        if eff_mode == "sleep" and self.frame_count % 40 == 0:
-            self.spawn_particles("zzz", 1)
-        elif eff_mode == "coding" and self.frame_count % 20 == 0:
-            self.spawn_particles("sparkle", 1)
-        elif eff_mode in ("petting", "eating") and self.frame_count % 16 == 0:
-            self.spawn_particles("heart", 1)
+        # Ambient pixel particles (time-based intervals matching 60fps cadence)
+        if eff_mode == "sleep":
+            if now - self._last_ambient_particle_time >= 40.0 / 60.0:
+                self._last_ambient_particle_time = now
+                self.spawn_particles("zzz", 1)
+        elif eff_mode == "coding":
+            if now - self._last_ambient_particle_time >= 20.0 / 60.0:
+                self._last_ambient_particle_time = now
+                self.spawn_particles("sparkle", 1)
+        elif eff_mode in ("petting", "eating"):
+            if now - self._last_ambient_particle_time >= 16.0 / 60.0:
+                self._last_ambient_particle_time = now
+                self.spawn_particles("heart", 1)
+
+        # Update particle physics before computing render_key
+        if self.particles:
+            self._update_particles(dt_60)
 
         # Wing speed: fast only when actively working or alerting; calm in idle & done!
         if eff_mode in ("needs_input", "coding", "command", "swarm", "dragged"):
-            wing_frame = (self.frame_count // 2) % 3
+            wing_frame = int(t * 30.0) % 3
         else:
-            wing_frame = (self.frame_count // 5) % 3
+            wing_frame = int(t * 12.0) % 3
 
         # Eye expression
         if now >= self.next_blink:
@@ -744,12 +795,16 @@ class KawaiiBeeWidget:
             # Calm normal eyes in idle AND done (with normal blinking)
             eye_state = "normal"
 
-        # Subtle 1-pixel eye tracking towards mouse cursor (throttled to every 3rd frame)
+        # Subtle 1-pixel eye tracking towards mouse cursor (throttled to ~0.20s, skipped in sleep/reading)
         if eff_mode == "reading":
             look_dx = -1 if int(t * 3) % 2 == 0 else 1
             look_dy = 0
+        elif eff_mode == "sleep":
+            look_dx = self._cached_look_dx
+            look_dy = self._cached_look_dy
         else:
-            if self.frame_count % 3 == 0:
+            if now - self._last_pointer_poll >= 0.20:
+                self._last_pointer_poll = now
                 try:
                     mx, my = self.root.winfo_pointerxy()
                     rel_x = mx - (self.win_x + bx)
@@ -771,16 +826,12 @@ class KawaiiBeeWidget:
         prop_frame = int(t * 4) % 12
         leg_shift = 1 if self.vx < -3 else (-1 if self.vx > 3 else 0)
 
-        # 1. Ground shadow
         shadow_w = (6 * sc) if bob_y >= 0 else (4 * sc)
         shadow_y = base_cy + 15 * sc
-        self.canvas.create_rectangle(
-            cx - shadow_w, shadow_y, cx + shadow_w, shadow_y + sc,
-            fill="#2C1810", outline=""
-        )
 
         # Precompute orbiting mini-bee positions once per frame in swarm mode
         mini_bee_positions = []
+        mb_frame = int(t * 20.0) % 2 if eff_mode == "swarm" else -1
         if eff_mode == "swarm":
             for i in range(3):
                 angle = t * 2.6 + i * (2 * math.pi / 3)
@@ -789,108 +840,171 @@ class KawaiiBeeWidget:
                 my = int((by + z * (5.0 * sc)) // sc) * sc
                 mini_bee_positions.append((mx, my, z))
 
-        # 2. Orbiting mini bees behind (Swarm mode)
-        if eff_mode == "swarm":
-            self._draw_mini_bees(mini_bee_positions, behind=True)
-
-        # 3. Main Pixel-Art Bee Sprite
-        sprite = self.renderer.get_bee_sprite(
+        norm_key = self.renderer._normalize_key(
             eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
         )
-        self.canvas.create_image(bx, by, image=sprite, anchor="center")
 
-        # 4. Orbiting mini bees in front (Swarm mode)
-        if eff_mode == "swarm":
-            self._draw_mini_bees(mini_bee_positions, behind=False)
+        particle_state = tuple(
+            (int(p["x"] // 2) * 2, int(p["y"] // 2) * 2, p["kind"])
+            for p in self.particles
+        )
 
-        # 5. Pixel-Art Particles
-        self._update_and_draw_particles()
-
-        # 6. Retro Pixel-Art RPG Dialogue Bubble (ONLY shown on mouse hover)
-        bub_rects = None
         if self.is_hovered:
             txt = self.bubble_text if now < self.bubble_until and self.bubble_text else (self.detail or "Ready")
             offset_top = (16 * sc) if eff_mode in ("needs_input", "error") else (12 * sc)
             bub_y = by - offset_top
-            bub_rects = self._draw_pixel_speech_box(bx, bub_y, txt, eff_mode)
+            bubble_state = (bx, bub_y, txt, eff_mode)
+        else:
+            bubble_state = None
 
-        # 7. Linux X11 XShape pixel-perfect transparency mask (no-op on Windows)
-        if IS_LINUX:
-            norm_key = self.renderer._normalize_key(
+        mini_bee_state = (
+            (mb_frame, tuple((mx, my, z >= 0) for mx, my, z in mini_bee_positions))
+            if eff_mode == "swarm"
+            else None
+        )
+
+        render_key = (
+            self.pixel_scale,
+            bx,
+            by,
+            norm_key,
+            shadow_w,
+            bubble_state,
+            mini_bee_state,
+            particle_state,
+        )
+
+        if render_key != self._last_render_key:
+            # 1. Ground shadow (reused persistent canvas item)
+            shadow_coords = (cx - shadow_w, shadow_y, cx + shadow_w, shadow_y + sc)
+            if self._shadow_id is None:
+                self._shadow_id = self.canvas.create_rectangle(
+                    *shadow_coords, fill="#2C1810", outline=""
+                )
+            elif self._last_shadow_coords != shadow_coords:
+                self.canvas.coords(self._shadow_id, *shadow_coords)
+            self._last_shadow_coords = shadow_coords
+
+            # 2. Main Pixel-Art Bee Sprite (reused persistent canvas item)
+            sprite = self.renderer.get_bee_sprite(
                 eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
             )
-            mb_frame = (self.frame_count // 3) % 2 if eff_mode == "swarm" else -1
-            shape_key = (
-                bx,
-                by,
-                norm_key,
-                shadow_w,
-                tuple((int(p["x"] // 2), int(p["y"] // 2), p["kind"]) for p in self.particles),
-                tuple(bub_rects) if bub_rects else None,
-                mb_frame,
-                tuple((mx, my) for mx, my, _ in mini_bee_positions) if eff_mode == "swarm" else None,
-            )
-            if shape_key != self._last_shape_key:
-                shape_rects = [
-                    (cx - shadow_w, shadow_y, 2 * shadow_w, sc)
-                ]
-                # Main bee sprite top-left offset (44x40 base grid anchored at center)
-                bee_x0 = bx - 22 * sc
-                bee_y0 = by - 20 * sc
-                for rx, ry, rw, rh in self.renderer.get_bee_rects(
-                    eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
-                ):
-                    shape_rects.append((bee_x0 + rx, bee_y0 + ry, rw, rh))
+            if self._bee_img_id is None:
+                self._bee_img_id = self.canvas.create_image(bx, by, image=sprite, anchor="center")
+            else:
+                if self._last_bee_pos != (bx, by):
+                    self.canvas.coords(self._bee_img_id, bx, by)
+                if self._last_bee_sprite is not sprite:
+                    self.canvas.itemconfigure(self._bee_img_id, image=sprite)
+            self._last_bee_pos = (bx, by)
+            self._last_bee_sprite = sprite
 
-                # Mini bees in swarm mode
+            # 3. Dynamic tagged items (mini-bees, particles, speech bubble)
+            dyn_key = (bubble_state, mini_bee_state, particle_state)
+            if dyn_key != self._last_dyn_key:
+                self.canvas.delete("dyn")
                 if eff_mode == "swarm":
-                    mb_key = f"mini_bee_{mb_frame}"
-                    mb_rects, mb_w, mb_h = self.renderer.particle_rects_cache.get(mb_key, ([], 0, 0))
-                    for mx, my, _ in mini_bee_positions:
-                        mx0 = mx - mb_w // 2
-                        my0 = my - mb_h // 2
-                        for rx, ry, rw, rh in mb_rects:
-                            shape_rects.append((mx0 + rx, my0 + ry, rw, rh))
+                    self._draw_mini_bees(mini_bee_positions, mb_frame, behind=True)
+                    self._draw_mini_bees(mini_bee_positions, mb_frame, behind=False)
+                self._draw_particles()
+                bub_rects = None
+                if bubble_state is not None:
+                    bub_rects = self._draw_pixel_speech_box(*bubble_state)
+                self._last_bub_rects = bub_rects
+                self._last_dyn_key = dyn_key
+            else:
+                bub_rects = self._last_bub_rects
 
-                # Active particles
-                for p in self.particles:
-                    p_rects, pw, ph = self.renderer.particle_rects_cache.get(p["kind"], ([], 0, 0))
-                    px = int(p["x"] // 2) * 2 - pw // 2
-                    py = int(p["y"] // 2) * 2 - ph // 2
-                    for rx, ry, rw, rh in p_rects:
-                        shape_rects.append((px + rx, py + ry, rw, rh))
+            # 4. Linux X11 XShape pixel-perfect transparency mask (no-op on Windows)
+            if IS_LINUX:
+                shape_key = (
+                    bx,
+                    by,
+                    norm_key,
+                    shadow_w,
+                    tuple((int(p["x"] // 2), int(p["y"] // 2), p["kind"]) for p in self.particles),
+                    tuple(bub_rects) if bub_rects else None,
+                    mb_frame,
+                    tuple((mx, my) for mx, my, _ in mini_bee_positions) if eff_mode == "swarm" else None,
+                )
+                if shape_key != self._last_shape_key:
+                    shape_rects = [
+                        (cx - shadow_w, shadow_y, 2 * shadow_w, sc)
+                    ]
+                    # Main bee sprite top-left offset (44x40 base grid anchored at center)
+                    bee_x0 = bx - 22 * sc
+                    bee_y0 = by - 20 * sc
+                    for rx, ry, rw, rh in self.renderer.get_bee_rects(
+                        eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+                    ):
+                        shape_rects.append((bee_x0 + rx, bee_y0 + ry, rw, rh))
 
-                # Speech bubble
-                if bub_rects:
-                    shape_rects.extend(bub_rects)
+                    # Mini bees in swarm mode
+                    if eff_mode == "swarm":
+                        mb_key = f"mini_bee_{mb_frame}"
+                        mb_rects, mb_w, mb_h = self.renderer.particle_rects_cache.get(mb_key, ([], 0, 0))
+                        for mx, my, _ in mini_bee_positions:
+                            mx0 = mx - mb_w // 2
+                            my0 = my - mb_h // 2
+                            for rx, ry, rw, rh in mb_rects:
+                                shape_rects.append((mx0 + rx, my0 + ry, rw, rh))
 
-                if apply_window_shape_rects(self.root, shape_rects):
-                    self._last_shape_key = shape_key
+                    # Active particles
+                    for p in self.particles:
+                        p_rects, pw, ph = self.renderer.particle_rects_cache.get(p["kind"], ([], 0, 0))
+                        px = int(p["x"] // 2) * 2 - pw // 2
+                        py = int(p["y"] // 2) * 2 - ph // 2
+                        for rx, ry, rw, rh in p_rects:
+                            shape_rects.append((px + rx, py + ry, rw, rh))
+
+                    # Speech bubble
+                    if bub_rects:
+                        shape_rects.extend(bub_rects)
+
+                    if apply_window_shape_rects(self.root, shape_rects):
+                        self._last_shape_key = shape_key
+
+            self._last_render_key = render_key
 
         if not self._quitting:
-            self._anim_after_id = self.root.after(16, self.animate)
+            if (
+                eff_mode in ("needs_input", "dragged", "swarm", "eating", "petting")
+                or now < self.poke_until
+                or len(self.particles) > 0
+            ):
+                next_ms = 42
+            elif eff_mode == "sleep":
+                next_ms = 166
+            else:
+                next_ms = 83
+            self._anim_after_id = self.root.after(next_ms, self.animate)
 
-    def _draw_mini_bees(self, mini_bee_positions, behind=True):
-        mb_sprite = self.renderer.particle_cache[f"mini_bee_{(self.frame_count // 3) % 2}"]
+    def _draw_mini_bees(self, mini_bee_positions, mb_frame: int, behind=True):
+        mb_sprite = self.renderer.particle_cache[f"mini_bee_{mb_frame}"]
         for mx, my, z in mini_bee_positions:
             if (behind and z >= 0) or (not behind and z < 0):
                 continue
-            self.canvas.create_image(mx, my, image=mb_sprite, anchor="center")
+            item_id = self.canvas.create_image(mx, my, image=mb_sprite, anchor="center", tags=("dyn",))
+            if behind and self._bee_img_id is not None:
+                self.canvas.tag_lower(item_id, self._bee_img_id)
 
-    def _update_and_draw_particles(self):
+    def _update_particles(self, dt_60: float):
         alive = []
         for p in self.particles:
-            p["life"] += 1
+            p["life"] += dt_60
             if p["life"] < p["max_life"]:
-                p["x"] += p["vx"]
-                p["y"] += p["vy"]
-                spr = self.renderer.particle_cache.get(p["kind"])
-                if spr:
-                    px = int(p["x"] // 2) * 2
-                    py = int(p["y"] // 2) * 2
-                    self.canvas.create_image(px, py, image=spr, anchor="center")
+                p["x"] += p["vx"] * dt_60
+                p["y"] += p["vy"] * dt_60
                 alive.append(p)
         self.particles = alive
+
+    def _draw_particles(self):
+        for p in self.particles:
+            spr = self.renderer.particle_cache.get(p["kind"])
+            if spr:
+                px = int(p["x"] // 2) * 2
+                py = int(p["y"] // 2) * 2
+                self.canvas.create_image(px, py, image=spr, anchor="center", tags=("dyn",))
 
     def _draw_pixel_speech_box(self, x, y, text, eff_mode):
         if len(text) > 28:
@@ -926,6 +1040,7 @@ class KawaiiBeeWidget:
                 text=disp_text,
                 fill=text_col,
                 font=(UI_FONT_FAMILY, font_px, "bold"),
+                tags=("dyn",),
             )
         else:
             text_id = self.canvas.create_text(
@@ -933,6 +1048,7 @@ class KawaiiBeeWidget:
                 text=text,
                 fill=text_col,
                 font=(UI_FONT_FAMILY, font_px, "bold"),
+                tags=("dyn",),
             )
             bbox = self.canvas.bbox(text_id)
             if bbox:
@@ -974,23 +1090,23 @@ class KawaiiBeeWidget:
         x0, y0 = int(x - w // 2), int(y - h // 2)
         x1, y1 = int(x + w // 2), int(y + h // 2)
 
-        self.canvas.create_rectangle(x0 + 4, y0, x1 - 4, y1, fill=border_col, outline="")
-        self.canvas.create_rectangle(x0, y0 + 4, x1, y1 - 4, fill=border_col, outline="")
-        self.canvas.create_rectangle(x0 + 4, y0 + 3, x1 - 4, y1 - 3, fill=inner_border, outline="")
-        self.canvas.create_rectangle(x0 + 3, y0 + 4, x1 - 3, y1 - 4, fill=inner_border, outline="")
-        self.canvas.create_rectangle(x0 + 6, y0 + 5, x1 - 6, y1 - 5, fill=bg_col, outline="")
+        self.canvas.create_rectangle(x0 + 4, y0, x1 - 4, y1, fill=border_col, outline="", tags=("dyn",))
+        self.canvas.create_rectangle(x0, y0 + 4, x1, y1 - 4, fill=border_col, outline="", tags=("dyn",))
+        self.canvas.create_rectangle(x0 + 4, y0 + 3, x1 - 4, y1 - 3, fill=inner_border, outline="", tags=("dyn",))
+        self.canvas.create_rectangle(x0 + 3, y0 + 4, x1 - 3, y1 - 4, fill=inner_border, outline="", tags=("dyn",))
+        self.canvas.create_rectangle(x0 + 6, y0 + 5, x1 - 6, y1 - 5, fill=bg_col, outline="", tags=("dyn",))
 
         # Seamless downward-pointing pixel arrow (▼) toward the bee
         # Outer dark border steps tapering down
-        self.canvas.create_rectangle(x - 8, y1, x + 8, y1 + 3, fill=border_col, outline="")
-        self.canvas.create_rectangle(x - 5, y1 + 3, x + 5, y1 + 6, fill=border_col, outline="")
-        self.canvas.create_rectangle(x - 2, y1 + 6, x + 2, y1 + 9, fill=border_col, outline="")
+        self.canvas.create_rectangle(x - 8, y1, x + 8, y1 + 3, fill=border_col, outline="", tags=("dyn",))
+        self.canvas.create_rectangle(x - 5, y1 + 3, x + 5, y1 + 6, fill=border_col, outline="", tags=("dyn",))
+        self.canvas.create_rectangle(x - 2, y1 + 6, x + 2, y1 + 9, fill=border_col, outline="", tags=("dyn",))
         # Inner colored frame steps tapering down
-        self.canvas.create_rectangle(x - 6, y1 - 3, x + 6, y1 + 3, fill=inner_border, outline="")
-        self.canvas.create_rectangle(x - 3, y1 + 3, x + 3, y1 + 6, fill=inner_border, outline="")
+        self.canvas.create_rectangle(x - 6, y1 - 3, x + 6, y1 + 3, fill=inner_border, outline="", tags=("dyn",))
+        self.canvas.create_rectangle(x - 3, y1 + 3, x + 3, y1 + 6, fill=inner_border, outline="", tags=("dyn",))
         # Interior parchment fill seamlessly connecting from box interior (y1 - 6) down into arrow
-        self.canvas.create_rectangle(x - 4, y1 - 6, x + 4, y1 + 2, fill=bg_col, outline="")
-        self.canvas.create_rectangle(x - 2, y1 + 2, x + 2, y1 + 4, fill=bg_col, outline="")
+        self.canvas.create_rectangle(x - 4, y1 - 6, x + 4, y1 + 2, fill=bg_col, outline="", tags=("dyn",))
+        self.canvas.create_rectangle(x - 2, y1 + 2, x + 2, y1 + 4, fill=bg_col, outline="", tags=("dyn",))
 
         # Raise the measured text above the bubble background rectangles
         self.canvas.tag_raise(text_id)

@@ -324,19 +324,22 @@ class TranscriptWatcher:
                         return None
         return None
 
-    def poll(self, now: float = 0.0) -> tuple[str, str] | None:
-        st_data = read_state()
+    def poll(self, now: float = 0.0, state_data: dict | None = None) -> tuple[str, str] | None:
+        st_data = state_data if state_data is not None else read_state()
         if not st_data.get("swarm_active", False):
             self.swarm_parent_path = None
 
         state_tp = st_data.get("transcript_path", "")
         resolved_tp: Path | None = None
+        cached_st: os.stat_result | None = None
         if state_tp:
             try:
                 cand = Path(state_tp)
-                if cand.exists() and cand.is_file():
+                cand_st = cand.stat()
+                if stat.S_ISREG(cand_st.st_mode):
                     resolved_tp = cand
-            except Exception:
+                    cached_st = cand_st
+            except OSError:
                 resolved_tp = None
 
         if resolved_tp is not None:
@@ -351,32 +354,40 @@ class TranscriptWatcher:
                 self.last_scan = mono_now
                 gemini_dir = Path.home() / ".gemini"
                 newest_path = None
+                newest_st: os.stat_result | None = None
                 newest_mtime = 0.0
                 try:
                     for prod in ("antigravity-cli", "antigravity", "antigravity-ide"):
                         brain_dir = gemini_dir / prod / "brain"
-                        if not brain_dir.exists():
+                        try:
+                            conv_dirs = list(brain_dir.iterdir())
+                        except OSError:
                             continue
-                        for conv_dir in brain_dir.iterdir():
+                        for conv_dir in conv_dirs:
                             t_file = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
-                            if t_file.exists():
-                                mt = t_file.stat().st_mtime
-                                if mt > newest_mtime:
-                                    newest_mtime = mt
+                            try:
+                                t_st = t_file.stat()
+                                if stat.S_ISREG(t_st.st_mode) and t_st.st_mtime > newest_mtime:
+                                    newest_mtime = t_st.st_mtime
                                     newest_path = t_file
+                                    newest_st = t_st
+                            except OSError:
+                                pass
                 except Exception:
                     pass
-                if newest_path is not None and newest_path != self.last_path:
-                    self.last_path = newest_path
-                    self.last_mtime = 0.0
-                    self.last_mtime_ns = 0
-                    self.last_step = -1
+                if newest_path is not None:
+                    if newest_path != self.last_path:
+                        self.last_path = newest_path
+                        self.last_mtime = 0.0
+                        self.last_mtime_ns = 0
+                        self.last_step = -1
+                    cached_st = newest_st
 
-        if not self.last_path or not self.last_path.exists():
+        if not self.last_path:
             return None
 
         try:
-            st = self.last_path.stat()
+            st = cached_st if cached_st is not None else self.last_path.stat()
             if st.st_mtime_ns <= self.last_mtime_ns and st.st_mtime <= self.last_mtime:
                 return None
 

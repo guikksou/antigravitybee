@@ -15,6 +15,7 @@ import random
 import signal
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -175,12 +176,16 @@ class KawaiiBeeWaylandWidget:
         self.last_interaction = time.time()
         self.ghost_mode = bool(self.config.get("ghost", False))
         self.auto_launch = bool(self.config.get("auto_launch", True))
-        self.current_opacity = 0.45 if self.ghost_mode else 0.98
+        self.current_opacity = 0.45 if self.ghost_mode else 1.0
 
         # Caching & Animation state
         self._cached_look_dx = 0
         self._cached_look_dy = 0
+        self._last_pointer_poll = 0.0
         self._bubble_measure_cache: dict[tuple[str, int, int], tuple[str, int, int]] = {}
+        self._surface_cache: OrderedDict[tuple, object] = OrderedDict()
+        self._last_render_key: tuple | None = None
+        self._last_state_data: dict | None = None
         self._drag_moved_this_frame = False
         self._last_local_pointer: tuple[float, float] | None = None
 
@@ -210,6 +215,8 @@ class KawaiiBeeWaylandWidget:
         self.blink_until = 0.0
 
         self.t0 = time.time()
+        self._last_anim_time = self.t0
+        self._last_ambient_particle_time = self.t0
         self.frame_count = 0
         self._frame_snapshot: dict | None = None
 
@@ -232,6 +239,7 @@ class KawaiiBeeWaylandWidget:
 
         if not self.offscreen:
             cur_st = read_state()
+            self._last_state_data = cur_st
             new_host_pid = int(cur_st.get("host_pid", 0) or 0) if cur_st else 0
             if new_host_pid > 0 and is_pid_alive(new_host_pid):
                 self.host_pid = new_host_pid
@@ -240,16 +248,26 @@ class KawaiiBeeWaylandWidget:
             init_mode = cur_st.get("mode", "") if cur_st else ""
             if not cur_st or init_mode in ("quit", "quit_disable", "", "honey") or init_mode.startswith("size:"):
                 write_state("idle", "Idle", swarm_active=False, host_pid=self.host_pid)
+                self._last_state_data = read_state()
+                try:
+                    if STATE_FILE.exists():
+                        self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
+                except Exception:
+                    pass
 
         self._apply_opacity()
         self._frame_snapshot = self._compute_frame_state(time.time(), advance=False)
+        self._last_render_key = self._frame_snapshot.get("render_key")
 
         if has_display and not self._quitting:
             self._install_signal_handlers()
             self.poll_state()
             if not self._quitting:
                 self._poll_source_id = GLib.timeout_add(250, self.poll_state)
-                self._anim_source_id = GLib.timeout_add(16, self.animate)
+                self._anim_source_id = GLib.timeout_add(
+                    self._next_anim_interval_ms(time.time()),
+                    self.animate,
+                )
 
     # -------------------- Backend & Geometry Helpers --------------------
 
@@ -476,6 +494,8 @@ class KawaiiBeeWaylandWidget:
         self.height = preset["height"]
         self.renderer.set_scale(self.pixel_scale)
         self._bubble_measure_cache.clear()
+        self._surface_cache.clear()
+        self._last_render_key = None
         self.win_x, self.win_y = self._clamp_position(self.win_x, self.win_y)
         if self.drawing_area is not None:
             self.drawing_area.set_size_request(self.width, self.height)
@@ -650,6 +670,12 @@ class KawaiiBeeWaylandWidget:
                 self.set_mode("idle", "Idle", manual=True)
                 if not self.offscreen:
                     write_state("idle", "Idle")
+                    self._last_state_data = read_state()
+                    try:
+                        if STATE_FILE.exists():
+                            self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
+                    except Exception:
+                        pass
                 self.bubble_until = 0.0
                 self.spawn_particles("sparkle", 5)
             else:
@@ -703,6 +729,7 @@ class KawaiiBeeWaylandWidget:
                 pass
             self._leave_source_id = None
         self.is_hovered = True
+        self._last_render_key = None
         self._apply_opacity()
         if self.drawing_area is not None:
             self.drawing_area.queue_draw()
@@ -733,6 +760,7 @@ class KawaiiBeeWaylandWidget:
         self.is_hovered = False
         self.last_mouse_x = None
         self.pet_score = 0.0
+        self._last_render_key = None
         self._apply_opacity()
         if self.drawing_area is not None:
             self.drawing_area.queue_draw()
@@ -828,9 +856,10 @@ class KawaiiBeeWaylandWidget:
         elif self.ghost_mode:
             target = 0.45
         else:
-            target = 0.98
+            target = 1.0
         if target != self.current_opacity:
             self.current_opacity = target
+            self._last_render_key = None
             if self.drawing_area is not None:
                 self.drawing_area.queue_draw()
 
@@ -933,6 +962,7 @@ class KawaiiBeeWaylandWidget:
                     data = read_state()
                     if data:
                         self.last_state_mtime_ns = mtime_ns
+                        self._last_state_data = data
                         new_host_pid = int(data.get("host_pid", 0) or 0)
                         if new_host_pid > 0 and is_pid_alive(new_host_pid):
                             self.host_pid = new_host_pid
@@ -949,11 +979,13 @@ class KawaiiBeeWaylandWidget:
                         if new_mode.startswith("size:"):
                             self.set_size(new_mode.split(":", 1)[1])
                             write_state(self.mode, self.detail or "Idle")
+                            self._last_state_data = read_state()
                             if STATE_FILE.exists():
                                 self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
                         elif new_mode == "honey":
                             self.set_mode(new_mode, new_detail)
                             write_state(self.mode, self.detail or "Idle")
+                            self._last_state_data = read_state()
                             if STATE_FILE.exists():
                                 self.last_state_mtime_ns = STATE_FILE.stat().st_mtime_ns
                         else:
@@ -967,7 +999,7 @@ class KawaiiBeeWaylandWidget:
             return False
 
         # Live transcript polling
-        t_res = self.transcript_watcher.poll(now)
+        t_res = self.transcript_watcher.poll(now, state_data=self._last_state_data)
         if t_res is not None:
             self.set_mode(t_res[0], t_res[1])
 
@@ -988,20 +1020,39 @@ class KawaiiBeeWaylandWidget:
 
         return not self._quitting
 
-    # -------------------- 60 FPS Animation & 32-bit ARGB Cairo Rendering --------------------
+    # -------------------- Adaptive Animation & 32-bit ARGB Cairo Rendering --------------------
+
+    def _effective_mode(self, now: float) -> str:
+        if self.is_dragging:
+            return "dragged"
+        if now < self.eating_until:
+            return "eating"
+        if now < self.petting_until:
+            return "petting"
+        return self.mode
+
+    def _next_anim_interval_ms(self, now: float) -> int:
+        eff_mode = self._effective_mode(now)
+        if (
+            eff_mode in ("needs_input", "dragged", "swarm", "eating", "petting")
+            or now < self.poke_until
+            or len(self.particles) > 0
+        ):
+            return 42
+        if eff_mode == "sleep":
+            return 166
+        return 83
 
     def _compute_frame_state(self, now: float, advance: bool = True) -> dict:
         t = now - self.t0
+        dt_60 = 0.0
         if advance:
+            dt = max(0.0, min(now - self._last_anim_time, 0.25))
+            self._last_anim_time = now
+            dt_60 = dt * 60.0
             self.frame_count += 1
 
-        eff_mode = self.mode
-        if self.is_dragging:
-            eff_mode = "dragged"
-        elif now < self.eating_until:
-            eff_mode = "eating"
-        elif now < self.petting_until:
-            eff_mode = "petting"
+        eff_mode = self._effective_mode(now)
 
         sc = self.pixel_scale
         cx = self.width // 2
@@ -1028,17 +1079,25 @@ class KawaiiBeeWaylandWidget:
         by = base_cy + bob_y
 
         if advance:
-            if eff_mode == "sleep" and self.frame_count % 40 == 0:
-                self.spawn_particles("zzz", 1)
-            elif eff_mode == "coding" and self.frame_count % 20 == 0:
-                self.spawn_particles("sparkle", 1)
-            elif eff_mode in ("petting", "eating") and self.frame_count % 16 == 0:
-                self.spawn_particles("heart", 1)
+            ambient_kind = None
+            ambient_interval = None
+            if eff_mode == "sleep":
+                ambient_kind = "zzz"
+                ambient_interval = 40.0 / 60.0
+            elif eff_mode == "coding":
+                ambient_kind = "sparkle"
+                ambient_interval = 20.0 / 60.0
+            elif eff_mode in ("petting", "eating"):
+                ambient_kind = "heart"
+                ambient_interval = 16.0 / 60.0
+            if ambient_kind is not None and (now - self._last_ambient_particle_time) >= ambient_interval:
+                self._last_ambient_particle_time = now
+                self.spawn_particles(ambient_kind, 1)
 
         if eff_mode in ("needs_input", "coding", "command", "swarm", "dragged"):
-            wing_frame = (self.frame_count // 2) % 3
+            wing_frame = int(t * 30.0) % 3
         else:
-            wing_frame = (self.frame_count // 5) % 3
+            wing_frame = int(t * 12.0) % 3
 
         if advance and now >= self.next_blink:
             self.blink_until = now + 0.14
@@ -1059,8 +1118,12 @@ class KawaiiBeeWaylandWidget:
         if eff_mode == "reading":
             look_dx = -1 if int(t * 3) % 2 == 0 else 1
             look_dy = 0
+        elif eff_mode == "sleep":
+            look_dx = 0
+            look_dy = 0
         else:
-            if advance and self.frame_count % 3 == 0:
+            if advance and (now - self._last_pointer_poll) >= 0.20:
+                self._last_pointer_poll = now
                 pt = self._get_pointer_xy()
                 if pt is not None:
                     mx, my = pt
@@ -1095,12 +1158,37 @@ class KawaiiBeeWaylandWidget:
         if advance:
             alive = []
             for p in self.particles:
-                p["life"] += 1
+                p["life"] += dt_60
                 if p["life"] < p["max_life"]:
-                    p["x"] += p["vx"]
-                    p["y"] += p["vy"]
+                    p["x"] += p["vx"] * dt_60
+                    p["y"] += p["vy"] * dt_60
                     alive.append(p)
             self.particles = alive
+
+        mb_frame = int(t * 20.0) % 2
+        norm_key = self.renderer._normalize_key(
+            eff_mode, wing_frame, eye_state, look_dx, look_dy, prop_frame, leg_shift
+        )
+        hover_txt = (
+            (self.bubble_text if now < self.bubble_until and self.bubble_text else (self.detail or "Ready"))
+            if self.is_hovered
+            else ""
+        )
+        hover_key = (self.is_hovered, hover_txt, eff_mode if self.is_hovered else "")
+        particle_key = tuple((p["kind"], int(p["x"] // 2) * 2, int(p["y"] // 2) * 2) for p in self.particles)
+        mini_key = (mb_frame, tuple(mini_bee_positions)) if eff_mode == "swarm" else ()
+        render_key = (
+            sc,
+            bx,
+            by,
+            norm_key,
+            shadow_w,
+            shadow_y,
+            self.current_opacity,
+            hover_key,
+            mini_key,
+            particle_key,
+        )
 
         return {
             "now": now,
@@ -1115,19 +1203,29 @@ class KawaiiBeeWaylandWidget:
             "look_dy": look_dy,
             "prop_frame": prop_frame,
             "leg_shift": leg_shift,
+            "norm_key": norm_key,
             "shadow_w": shadow_w,
             "shadow_y": shadow_y,
             "mini_bee_positions": mini_bee_positions,
-            "mb_frame": (self.frame_count // 3) % 2,
+            "mb_frame": mb_frame,
+            "render_key": render_key,
         }
 
     def animate(self) -> bool:
+        self._anim_source_id = None
         if self._quitting:
             return False
-        self._frame_snapshot = self._compute_frame_state(time.time(), advance=True)
-        if self.drawing_area is not None:
-            self.drawing_area.queue_draw()
-        return not self._quitting
+        now = time.time()
+        snap = self._compute_frame_state(now, advance=True)
+        self._frame_snapshot = snap
+        render_key = snap["render_key"]
+        if render_key != self._last_render_key:
+            self._last_render_key = render_key
+            if self.drawing_area is not None:
+                self.drawing_area.queue_draw()
+        next_ms = self._next_anim_interval_ms(now)
+        self._anim_source_id = GLib.timeout_add(next_ms, self.animate)
+        return False
 
     def _draw_spans_cairo(
         self,
@@ -1147,6 +1245,27 @@ class KawaiiBeeWaylandWidget:
             cr.rectangle(x0 + x_start * scale, y0 + y * scale, span_len * scale, scale)
             cr.fill()
 
+    def _get_or_render_surface(
+        self,
+        cache_key: tuple,
+        spans: list[tuple[int, int, int, str]],
+        width: int,
+        height: int,
+        scale: int,
+    ):
+        surf = self._surface_cache.get(cache_key)
+        if surf is not None:
+            self._surface_cache.move_to_end(cache_key)
+            return surf
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        scr = cairo.Context(surf)
+        scr.set_antialias(cairo.ANTIALIAS_NONE)
+        self._draw_spans_cairo(scr, spans, 0, 0, scale, 1.0)
+        if len(self._surface_cache) >= 256:
+            self._surface_cache.popitem(last=False)
+        self._surface_cache[cache_key] = surf
+        return surf
+
     def _draw_mini_bees_cairo(
         self,
         cr,
@@ -1161,21 +1280,44 @@ class KawaiiBeeWaylandWidget:
             return
         pw = gw * p_scale
         ph = gh * p_scale
+        surf = self._get_or_render_surface(
+            ("particle", p_scale, f"mini_bee_{mb_frame}"),
+            spans,
+            pw,
+            ph,
+            p_scale,
+        )
         for mx, my, z in mini_bee_positions:
             if (behind and z >= 0) or (not behind and z < 0):
                 continue
-            self._draw_spans_cairo(cr, spans, mx - pw // 2, my - ph // 2, p_scale, opacity)
+            cr.set_source_surface(surf, mx - pw // 2, my - ph // 2)
+            if opacity < 0.999:
+                cr.paint_with_alpha(opacity)
+            else:
+                cr.paint()
 
     def _draw_particles_cairo(self, cr, p_scale: int, opacity: float) -> None:
         for p in self.particles:
-            spans, gw, gh = get_particle_color_spans(p["kind"])
+            kind = p["kind"]
+            spans, gw, gh = get_particle_color_spans(kind)
             if not spans:
                 continue
             pw = gw * p_scale
             ph = gh * p_scale
+            surf = self._get_or_render_surface(
+                ("particle", p_scale, kind),
+                spans,
+                pw,
+                ph,
+                p_scale,
+            )
             px = int(p["x"] // 2) * 2 - pw // 2
             py = int(p["y"] // 2) * 2 - ph // 2
-            self._draw_spans_cairo(cr, spans, px, py, p_scale, opacity)
+            cr.set_source_surface(surf, px, py)
+            if opacity < 0.999:
+                cr.paint_with_alpha(opacity)
+            else:
+                cr.paint()
 
     def _draw_pixel_speech_box_cairo(
         self,
@@ -1318,18 +1460,37 @@ class KawaiiBeeWaylandWidget:
             self._draw_mini_bees_cairo(cr, mini_bee_positions, mb_frame, p_scale, layer_alpha, behind=True)
 
         # 3. Main Pixel-Art Bee Sprite (44x40 base grid anchored at center)
-        bee_spans = self.renderer.get_bee_color_spans(
-            eff_mode,
-            snap["wing_frame"],
-            snap["eye_state"],
-            snap["look_dx"],
-            snap["look_dy"],
-            snap["prop_frame"],
-            snap["leg_shift"],
-        )
+        norm_key = snap.get("norm_key")
+        if norm_key is None:
+            norm_key = self.renderer._normalize_key(
+                eff_mode,
+                snap["wing_frame"],
+                snap["eye_state"],
+                snap["look_dx"],
+                snap["look_dy"],
+                snap["prop_frame"],
+                snap["leg_shift"],
+            )
+        bee_cache_key = ("bee", sc, norm_key)
+        bee_surf = self._surface_cache.get(bee_cache_key)
+        if bee_surf is not None:
+            self._surface_cache.move_to_end(bee_cache_key)
+        else:
+            bee_spans = self.renderer.get_bee_color_spans(*norm_key)
+            bee_surf = self._get_or_render_surface(
+                bee_cache_key,
+                bee_spans,
+                44 * sc,
+                40 * sc,
+                sc,
+            )
         bee_x0 = bx - 22 * sc
         bee_y0 = by - 20 * sc
-        self._draw_spans_cairo(cr, bee_spans, bee_x0, bee_y0, sc, layer_alpha)
+        cr.set_source_surface(bee_surf, bee_x0, bee_y0)
+        if layer_alpha < 0.999:
+            cr.paint_with_alpha(layer_alpha)
+        else:
+            cr.paint()
 
         # 4. Orbiting mini bees in front (Swarm mode)
         if eff_mode == "swarm":
