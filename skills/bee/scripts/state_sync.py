@@ -428,8 +428,14 @@ class TranscriptWatcher:
                     tc = tool_calls[-1]
                     t_name = (tc.get("name") or "").lower()
                     t_args = tc.get("args") or {}
+                    # When lifecycle hooks (bee_hook.py) are active, defer needs_input
+                    # to PreToolUse so the alert fires when the approval prompt actually
+                    # appears instead of 5-10s early when PLANNER_RESPONSE is written.
+                    hooks_active = bool(state_tp) or int(st_data.get("host_pid", 0) or 0) > 0
 
                     if t_name == "ask_question":
+                        if hooks_active:
+                            return None
                         return ("needs_input", "Question for you!")
                     if t_name == "run_command":
                         bypass = self._clean_arg(t_args.get("BypassSandbox")).lower() == "true"
@@ -437,6 +443,8 @@ class TranscriptWatcher:
                             t_args.get("toolSummary") or t_args.get("CommandLine") or "Command"
                         )
                         if bypass:
+                            if hooks_active:
+                                return None
                             return ("needs_input", f"Approval needed: {summary}")
                         return wrap_result("command", f"Terminal: {summary}")
                     if t_name in (
